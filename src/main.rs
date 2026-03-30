@@ -529,7 +529,7 @@ fn render_device_list(f: &mut Frame, app: &mut App, area: Rect) {
 
     let table = Table::new(rows, [Constraint::Percentage(100)])
         .block(Block::default().borders(Borders::ALL).title("Network Map"))
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD))
         .highlight_symbol(">> ");
 
     f.render_stateful_widget(table, area, &mut app.table_state);
@@ -550,7 +550,7 @@ fn render_details(f: &mut Frame, app: &mut App, area: Rect) {
     let table = Table::new(rows, [Constraint::Percentage(40), Constraint::Percentage(60)])
         .header(Row::new(vec!["Metric", "Value"]).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
         .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(Style::default().bg(Color::DarkGray));
+        .row_highlight_style(Style::default().bg(Color::DarkGray));
 
     f.render_stateful_widget(table, area, &mut app.details_state);
 
