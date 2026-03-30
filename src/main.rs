@@ -143,35 +143,62 @@ impl App {
         tokio::spawn(async move {
             let agent_addr = format!("{}:{}", ip, cfg.5);
             let timeout = Duration::from_millis(cfg.6);
-            let oids = [(".1.3.6.1.2.1.1.1.0", "Desc"), (".1.3.6.1.2.1.1.3.0", "Up"), (".1.3.6.1.2.1.1.5.0", "Name"), (".1.3.6.1.2.1.1.6.0", "Location")];
-            let mut results = Vec::new();
+            let oids = [
+                (".1.3.6.1.2.1.1.1.0", "System Desc"),
+                (".1.3.6.1.2.1.1.3.0", "Up-Time"),
+                (".1.3.6.1.2.1.1.5.0", "Device Name"),
+                (".1.3.6.1.2.1.1.6.0", "Location"),
+                (".1.3.6.1.2.1.33.1.1.1.0", "UPS Vendor (Std)"),
+                (".1.3.6.1.2.1.33.1.1.2.0", "UPS Model (Std)"),
+            ];
 
+            let mut results = Vec::new();
+            let mut snmp_success = false;
+
+            // Step 1: Try SNMP V3
             if !cfg.0.is_empty() {
                 let security = Security::new(cfg.0.as_bytes(), cfg.1.as_bytes()).with_auth_protocol(cfg.3).with_auth(Auth::AuthPriv { cipher: Cipher::Aes128, privacy_password: cfg.2.as_bytes().to_vec() });
                 if let Ok(mut session) = SyncSession::new_v3(&agent_addr, Some(timeout), 2, security) {
                     for (oid_str, label) in oids.iter() {
                         let parts: Vec<u64> = oid_str.split('.').filter(|s| !s.is_empty()).map(|s| s.parse::<u64>().unwrap_or(0)).collect();
                         if let Ok(oid) = Oid::from(&parts[..]) {
-                            if let Ok(resp) = session.get(&oid) { if let Some(vb) = resp.varbinds.into_iter().next() { results.push((label.to_string(), clean_snmp_value(&vb.1))); } }
+                            if let Ok(resp) = session.get(&oid) { 
+                                if let Some(vb) = resp.varbinds.into_iter().next() { 
+                                    results.push((label.to_string(), clean_snmp_value(&vb.1)));
+                                    snmp_success = true;
+                                } 
+                            }
                         }
                     }
                 }
             }
 
-            if results.is_empty() {
+            // Step 2: Try SNMP V2c
+            if !snmp_success {
                 if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, cfg.4.as_bytes(), Some(timeout), 2) {
                     for (oid_str, label) in oids.iter() {
                         let parts: Vec<u64> = oid_str.split('.').filter(|s| !s.is_empty()).map(|s| s.parse::<u64>().unwrap_or(0)).collect();
                         if let Ok(oid) = Oid::from(&parts[..]) {
-                            if let Ok(resp) = session.get(&oid) { if let Some(vb) = resp.varbinds.into_iter().next() { results.push((label.to_string(), clean_snmp_value(&vb.1))); } }
+                            if let Ok(resp) = session.get(&oid) { 
+                                if let Some(vb) = resp.varbinds.into_iter().next() { 
+                                    results.push((label.to_string(), clean_snmp_value(&vb.1)));
+                                    snmp_success = true;
+                                } 
+                            }
                         }
                     }
                 }
             }
 
-            if !results.is_empty() { let _ = tx.send(ScanMessage::MetricUpdated(results)); }
+            if !snmp_success {
+                results.push(("Status".to_string(), "Only TCP (Web) responded. SNMP Timeout or Wrong Credentials.".to_string()));
+            } else {
+                results.push(("Status".to_string(), "SNMP Connection SUCCESS".to_string()));
+            }
 
-            // Step 2: Identification (Supports V3)
+            let _ = tx.send(ScanMessage::MetricUpdated(results));
+
+            // Identification
             let dev_res = if !cfg.0.is_empty() { 
                 ups::identify_ups_v3(&agent_addr, &cfg.0, &cfg.1, &cfg.2, cfg.3).await 
             } else { 
@@ -432,11 +459,38 @@ fn render_details_view(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_uprober_view(f: &mut Frame, app: &App, area: Rect) {
-    let mut text = vec![Row::new(vec![Cell::from("UPS Intelligence Analysis").style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))])];
-    if let Some(dev) = &app.identified_ups { text.push(Row::new(vec![Cell::from(format!("HW: {} | FW: {}", dev.vendor, dev.model))])); }
-    if app.is_walking { text.push(Row::new(vec![Cell::from("Fetching real-time data...")])); }
-    for res in &app.diff_results { text.push(Row::new(vec![Cell::from(format!("• {}: -> {}", res.change_type, res.new_value)).style(Style::default().fg(Color::Yellow))])); }
-    f.render_widget(Table::new(text, [Constraint::Percentage(100)]).block(Block::default().borders(Borders::ALL).title("Uprober View")), area);
+    let mut rows = vec![Row::new(vec![Cell::from("UPS Intelligence Analysis Engine").style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))])];
+    
+    if let Some(dev) = &app.identified_ups {
+        rows.push(Row::new(vec![Cell::from(format!("HARDWARE: {} | MODEL: {}", dev.vendor, dev.model)).style(Style::default().fg(Color::Cyan))]));
+    }
+
+    if app.is_walking {
+        rows.push(Row::new(vec![Cell::from(">> FETCHING LIVE MIB DATA...").style(Style::default().fg(Color::Yellow))]));
+    } else if app.snapshot_a.is_some() && app.snapshot_b.is_none() {
+        rows.push(Row::new(vec![Cell::from("SNAPSHOT [A] CAPTURED!").style(Style::default().fg(Color::Green))]));
+        rows.push(Row::new(vec![Cell::from("=> Press '2' to capture [B] and see dynamic changes").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]));
+    } else if app.snapshot_b.is_some() {
+        rows.push(Row::new(vec![Cell::from("ANALYSIS COMPLETE (A vs B)").style(Style::default().fg(Color::Green))]));
+    }
+
+    if !app.diff_results.is_empty() {
+        rows.push(Row::new(vec![Cell::from("--- DETECTED CHANGES ---").style(Style::default().fg(Color::Red))]));
+        for res in &app.diff_results {
+            rows.push(Row::new(vec![Cell::from(format!("• {}: {}", res.change_type, res.new_value)).style(Style::default().fg(Color::Yellow))]));
+        }
+    } else if let Some(snap) = &app.snapshot_a {
+        rows.push(Row::new(vec![Cell::from("--- CURRENT LIVE VALUES ---").style(Style::default().fg(Color::DarkGray))]));
+        let mut sorted_keys: Vec<_> = snap.data.keys().collect();
+        sorted_keys.sort();
+        for k in sorted_keys.iter().take(15) { // Show first 15 values to avoid clutter
+            if let Some(v) = snap.data.get(*k) {
+                rows.push(Row::new(vec![Cell::from(format!("{}: {}", k, v)).style(Style::default().fg(Color::Gray))]));
+            }
+        }
+    }
+
+    f.render_widget(Table::new(rows, [Constraint::Percentage(100)]).block(Block::default().borders(Borders::ALL).title("Uprober Analytics")), area);
 }
 
 fn clean_snmp_value(val: &snmp2::Value) -> String {
