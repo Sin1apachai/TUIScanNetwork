@@ -19,12 +19,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod ups;
+mod device;
+use ups::{OidSnapshot, DiffResult, DefaultUprober, UpsDevice};
+use device::{DeviceCategory, DeviceInfo};
+
 /// Input modes for user interaction
 #[derive(PartialEq)]
 enum InputMode {
     Normal,         // Browsing mode
     EditingIP,      // Editing IP Address
     Scanning,       // Scanning network
+    UpsProbing,     // Probing UPS OIDs
 }
 
 /// App state structure
@@ -32,7 +38,8 @@ struct App {
     ip_address: String,           // Currently selected/edited IP
     community: String,            // SNMP Community string
     snmp_data: Vec<(String, String)>, // Fetched SNMP results (Label, Value)
-    discovered_ips: Vec<String>,  // List of IPs found during scan
+    discovered_devices: Vec<DeviceInfo>, // List of IPs found during scan with metadata
+    discovered_ips: Vec<String>,  // Keeps track for quick lookup
     status: String,               // Bottom status message
     input_mode: InputMode,        // Current input state
     cursor_position: usize,       // Cursor position for text entry
@@ -40,6 +47,11 @@ struct App {
     scan_progress: u32,           // Current scan count
     scan_total: u32,              // Total expected scan count
     selected_index: usize,        // Selected IP in discovery sidebar
+    snapshot_a: Option<OidSnapshot>,
+    snapshot_b: Option<OidSnapshot>,
+    diff_results: Vec<DiffResult>,
+    is_walking: bool,
+    identified_ups: Option<UpsDevice>,
 }
 
 impl App {
@@ -49,6 +61,7 @@ impl App {
             ip_address: "192.168.1.1".to_string(),
             community: "public".to_string(),
             snmp_data: Vec::new(),
+            discovered_devices: Vec::new(),
             discovered_ips: Vec::new(),
             status: "Ready".to_string(),
             input_mode: InputMode::Normal,
@@ -57,6 +70,11 @@ impl App {
             scan_progress: 0,
             scan_total: 0,
             selected_index: 0,
+            snapshot_a: None,
+            snapshot_b: None,
+            diff_results: Vec::new(),
+            is_walking: false,
+            identified_ups: None,
         }
     }
 
@@ -161,11 +179,17 @@ impl App {
         }
     }
 
+    fn trigger_ups_identification(&mut self, tx: Sender<ScanMessage>) {
+        self.identified_ups = None; // Reset previous identification
+        self.start_ups_identification(tx);
+    }
+
     // --- Concurrent network scan ---
 
     /// Start a network-wide scan for SNMP devices
     fn start_scan(&mut self, tx: Sender<ScanMessage>) {
         self.is_scanning = true;
+        self.discovered_devices.clear();
         self.discovered_ips.clear();
         self.selected_index = 0;
         self.scan_progress = 0;
@@ -186,8 +210,8 @@ impl App {
         // Spawn async scan task
         tokio::spawn(async move {
             let mut handles = vec![];
-            // Control concurrency to 20 probes at once
-            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(20));
+            // Control concurrency to 50 probes at once (faster but still safe)
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(50));
 
             for i in 1..=254 {
                 let ip = format!("{}.{}", subnet_prefix, i);
@@ -198,22 +222,48 @@ impl App {
                 let handle = tokio::spawn(async move {
                     let _permit = sem_clone.acquire().await.unwrap();
                     let agent_addr = format!("{}:161", ip);
-                    let timeout = Duration::from_millis(500);
-                    
-                    let oid_parts = vec![1, 3, 6, 1, 2, 1, 1, 1, 0]; // sysDescr
-                    let oid = Oid::from(&oid_parts).unwrap();
-                    
                     // Wrapping blocking SNMP call in spawn_blocking
                     let result = tokio::task::spawn_blocking(move || {
-                        if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, community.as_bytes(), Some(timeout), 0) {
-                            session.get(&oid).is_ok()
-                        } else {
-                            false
-                        }
-                    }).await.unwrap_or(false);
+                        let sys_descr_oid = Oid::from(&[1, 3, 6, 1, 2, 1, 1, 1, 0]).unwrap();
+                        let sys_object_id = Oid::from(&[1, 3, 6, 1, 2, 1, 1, 2, 0]).unwrap();
+                        let timeout = Duration::from_millis(1500);
 
-                    if result {
-                        let _ = tx.send(ScanMessage::Discovered(ip));
+                        // Try v2c then v1 as fallback
+                        if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, community.as_bytes(), Some(timeout), 0) {
+                            if let Ok(resp) = session.get(&sys_descr_oid) {
+                                if let Some(vb) = resp.varbinds.into_iter().next() {
+                                    let desc = format!("{:?}", vb.1);
+                                    let obj_id = if let Ok(resp2) = session.get(&sys_object_id) {
+                                        if let Some(vb2) = resp2.varbinds.into_iter().next() {
+                                            format!("{:?}", vb2.1)
+                                        } else { "".to_string() }
+                                    } else { "".to_string() };
+                                    let category = device::identify_category(&desc, &obj_id);
+                                    return Some((desc, category));
+                                }
+                            }
+                        }
+                        // Fallback to v1
+                        if let Ok(mut session) = SyncSession::new_v1(&agent_addr, community.as_bytes(), Some(timeout), 0) {
+                            if let Ok(resp) = session.get(&sys_descr_oid) {
+                                if let Some(vb) = resp.varbinds.into_iter().next() {
+                                    let desc = format!("{:?}", vb.1);
+                                    let category = device::identify_category(&desc, "");
+                                    return Some((desc, category));
+                                }
+                            }
+                        }
+                        None
+                    }).await.unwrap_or(None);
+
+                    if let Some((desc, category)) = result {
+                        let info = DeviceInfo {
+                            ip: ip.clone(),
+                            category,
+                            _description: desc,
+                            _sys_name: "".to_string(),
+                        };
+                        let _ = tx.send(ScanMessage::Discovered(info));
                     }
                     let _ = tx.send(ScanMessage::Progress(1, 254));
                 });
@@ -226,13 +276,62 @@ impl App {
             let _ = tx.send(ScanMessage::Status("Scan complete.".to_string()));
         });
     }
+
+    /// Start a full walk for UPS OID identification
+    fn start_ups_walk(&mut self, is_second: bool, tx: Sender<ScanMessage>) {
+        if self.is_walking { return; }
+        self.is_walking = true;
+        self.status = format!("Walking .1.3.6.1.4.1 ({} snapshot)...", if is_second { "Second" } else { "First" });
+        
+        let ip = self.ip_address.clone();
+        let community = self.community.clone();
+
+        tokio::spawn(async move {
+            let root_oid = vec![1, 3];
+            let addr = format!("{}:161", ip);
+            
+            match ups::snmp_walk(&addr, &community, &root_oid).await {
+                Ok(data) => {
+                    let snapshot = OidSnapshot {
+                        _timestamp: Instant::now(),
+                        data,
+                    };
+                    let _ = tx.send(ScanMessage::UpsResult(snapshot, is_second));
+                }
+                Err(e) => {
+                    let _ = tx.send(ScanMessage::Status(format!("Walk failed: {}", e)));
+                }
+            }
+        });
+    }
+
+    fn start_ups_identification(&mut self, tx: Sender<ScanMessage>) {
+        let ip = self.ip_address.clone();
+        let community = self.community.clone();
+        tokio::spawn(async move {
+            let addr = format!("{}:161", ip);
+            if let Ok(Some(device)) = ups::identify_ups(&addr, &community).await {
+                let _ = tx.send(ScanMessage::UpsIdentified(device));
+            }
+        });
+    }
+
+    fn calculate_diffs(&mut self) {
+        if let (Some(a), Some(b)) = (&self.snapshot_a, &self.snapshot_b) {
+            let prober = DefaultUprober;
+            self.diff_results = ups::diff_snapshots(a, b, &prober);
+            self.status = format!("Diff complete: found {} changes.", self.diff_results.len());
+        }
+    }
 }
 
 /// Message enum for communication between scanner and UI
 enum ScanMessage {
     Progress(u32, u32),
-    Discovered(String),
+    Discovered(DeviceInfo),
     Status(String),
+    UpsResult(OidSnapshot, bool), // (Data, IsSecond)
+    UpsIdentified(UpsDevice),
 }
 
 // --- Main execution block ---
@@ -291,16 +390,32 @@ async fn run_app<B: Backend>(
                         if app.input_mode == InputMode::Scanning {
                             app.input_mode = InputMode::Normal;
                         }
-                        app.status = format!("Found {} devices.", app.discovered_ips.len());
+                        app.status = format!("Found {} devices.", app.discovered_devices.len());
                     }
                 }
-                ScanMessage::Discovered(ip) => {
-                    if !app.discovered_ips.contains(&ip) {
-                        app.discovered_ips.push(ip);
+                ScanMessage::Discovered(info) => {
+                    if !app.discovered_ips.contains(&info.ip) {
+                        app.discovered_ips.push(info.ip.clone());
+                        app.discovered_devices.push(info);
                     }
                 }
                 ScanMessage::Status(s) => {
                     app.status = s;
+                }
+                ScanMessage::UpsResult(snapshot, is_second) => {
+                    app.is_walking = false;
+                    let count = snapshot.data.len();
+                    if is_second {
+                        app.snapshot_b = Some(snapshot);
+                        app.calculate_diffs();
+                        app.status = format!("Snapshot B complete ({} OIDs). Found {} changes.", count, app.diff_results.len());
+                    } else {
+                        app.snapshot_a = Some(snapshot);
+                        app.status = format!("Snapshot A complete ({} OIDs). Trigger change and press '2'.", count);
+                    }
+                }
+                ScanMessage::UpsIdentified(device) => {
+                    app.identified_ups = Some(device);
                 }
             }
         }
@@ -322,7 +437,10 @@ async fn run_app<B: Backend>(
                             app.input_mode = InputMode::EditingIP;
                             app.reset_cursor();
                         }
-                        KeyCode::Char('r') => app.update_snmp(),
+                        KeyCode::Char('r') => {
+                            app.update_snmp();
+                            app.trigger_ups_identification(tx.clone());
+                        }
                         KeyCode::Char('s') => {
                             if !app.is_scanning {
                                 app.input_mode = InputMode::Scanning;
@@ -330,22 +448,27 @@ async fn run_app<B: Backend>(
                             }
                         }
                         KeyCode::Down => {
-                            if !app.discovered_ips.is_empty() {
-                                app.selected_index = (app.selected_index + 1) % app.discovered_ips.len();
-                                app.ip_address = app.discovered_ips[app.selected_index].clone();
+                            if !app.discovered_devices.is_empty() {
+                                app.selected_index = (app.selected_index + 1) % app.discovered_devices.len();
+                                app.ip_address = app.discovered_devices[app.selected_index].ip.clone();
                                 app.update_snmp();
+                                app.trigger_ups_identification(tx.clone());
                             }
                         }
                         KeyCode::Up => {
-                            if !app.discovered_ips.is_empty() {
+                            if !app.discovered_devices.is_empty() {
                                 if app.selected_index > 0 {
                                     app.selected_index -= 1;
                                 } else {
-                                    app.selected_index = app.discovered_ips.len() - 1;
+                                    app.selected_index = app.discovered_devices.len() - 1;
                                 }
-                                app.ip_address = app.discovered_ips[app.selected_index].clone();
+                                app.ip_address = app.discovered_devices[app.selected_index].ip.clone();
                                 app.update_snmp();
+                                app.trigger_ups_identification(tx.clone());
                             }
+                        }
+                        KeyCode::Char('u') => {
+                            app.input_mode = InputMode::UpsProbing;
                         }
                         _ => {}
                     },
@@ -353,6 +476,7 @@ async fn run_app<B: Backend>(
                         KeyCode::Enter => {
                             app.input_mode = InputMode::Normal;
                             app.update_snmp();
+                            app.trigger_ups_identification(tx.clone());
                         }
                         KeyCode::Char(c) => app.enter_char(c),
                         KeyCode::Backspace => app.delete_char(),
@@ -362,6 +486,21 @@ async fn run_app<B: Backend>(
                         _ => {}
                     },
                     InputMode::Scanning => match key.code {
+                        KeyCode::Esc => app.input_mode = InputMode::Normal,
+                        _ => {}
+                    },
+                    InputMode::UpsProbing => match key.code {
+                        KeyCode::Char('1') => {
+                            app.start_ups_walk(false, tx.clone());
+                        }
+                        KeyCode::Char('2') => {
+                            app.start_ups_walk(true, tx.clone());
+                        }
+                        KeyCode::Char('c') => {
+                            app.snapshot_a = None;
+                            app.snapshot_b = None;
+                            app.diff_results.clear();
+                        }
                         KeyCode::Esc => app.input_mode = InputMode::Normal,
                         _ => {}
                     },
@@ -417,20 +556,30 @@ fn ui(f: &mut Frame, app: &App) {
 
     // Discovery Sidebar
     let ips: Vec<Row> = app
-        .discovered_ips
+        .discovered_devices
         .iter()
-        .map(|ip| {
-            Row::new(vec![Cell::from(ip.clone())])
-                .style(if ip == &app.ip_address {
+        .map(|info| {
+            let color = match info.category {
+                DeviceCategory::UPS => Color::LightRed,
+                DeviceCategory::RouterSwitch => Color::Cyan,
+                DeviceCategory::Printer => Color::Green,
+                DeviceCategory::NAS => Color::Yellow,
+                DeviceCategory::Server => Color::Blue,
+                DeviceCategory::Unknown => Color::White,
+            };
+            
+            Row::new(vec![
+                Cell::from(format!("{} {}", info.category, info.ip)).style(if info.ip == app.ip_address {
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default()
+                    Style::default().fg(color)
                 })
+            ])
         })
         .collect();
 
     let ips_table = Table::new(ips, [Constraint::Percentage(100)])
-        .block(Block::default().borders(Borders::ALL).title(format!("Discovery ({})", app.discovered_ips.len())))
+        .block(Block::default().borders(Borders::ALL).title(format!("Devices ({})", app.discovered_devices.len())))
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_widget(ips_table, main_chunks[0]);
 
@@ -454,10 +603,76 @@ fn ui(f: &mut Frame, app: &App) {
         Row::new(vec!["Metric", "Value"])
             .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
     )
-    .block(Block::default().borders(Borders::ALL).title("SNMP Results"))
+    .block(Block::default().borders(Borders::ALL).title(match &app.identified_ups {
+        Some(ups) => format!("SNMP Results [Identified: {} {}]", ups.vendor, ups.model),
+        None => "SNMP Results".to_string(),
+    }))
     .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
-    f.render_widget(table, main_chunks[1]);
+    if app.input_mode != InputMode::UpsProbing {
+        f.render_widget(table, main_chunks[1]);
+    } else {
+        // UPS Identification Table
+        let diff_rows: Vec<Row> = app
+            .diff_results
+            .iter()
+            .map(|d| {
+                Row::new(vec![
+                    Cell::from(d.oid.clone()),
+                    Cell::from(d.old_value.clone()),
+                    Cell::from(d.new_value.clone()),
+                    Cell::from(d.change_type.clone()),
+                ])
+                .style(if d.change_type.contains("Battery") || d.change_type.contains("Voltage") {
+                    Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                })
+            })
+            .collect();
+
+        let diff_table = Table::new(
+            diff_rows,
+            [
+                Constraint::Percentage(30),
+                Constraint::Percentage(20),
+                Constraint::Percentage(20),
+                Constraint::Percentage(30),
+            ],
+        )
+        .header(
+            Row::new(vec!["OID", "Old Value", "New Value", "Possible Meaning"])
+                .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        )
+        .block(Block::default().borders(Borders::ALL).title("UPS OID Identification (Diff Results)"))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+        if app.diff_results.is_empty() {
+            if app.snapshot_a.is_some() {
+                let msg = Row::new(vec![
+                    Cell::from("Snapshot A stored").style(Style::default().fg(Color::Yellow)),
+                    Cell::from("-"),
+                    Cell::from("-"),
+                    Cell::from("Now trigger changes and press '2'"),
+                ]);
+                f.render_widget(Table::new(vec![msg], [Constraint::Percentage(30), Constraint::Percentage(20), Constraint::Percentage(20), Constraint::Percentage(30)])
+                    .header(Row::new(vec!["OID", "Old Value", "New Value", "Possible Meaning"]).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+                    .block(Block::default().borders(Borders::ALL).title("UPS OID Identification (Diff Results)")), main_chunks[1]);
+            } else {
+                let msg = Row::new(vec![
+                    Cell::from("Waiting for Snapshot A").style(Style::default().fg(Color::DarkGray)),
+                    Cell::from("-"),
+                    Cell::from("-"),
+                    Cell::from("Press '1' to start"),
+                ]);
+                f.render_widget(Table::new(vec![msg], [Constraint::Percentage(30), Constraint::Percentage(20), Constraint::Percentage(20), Constraint::Percentage(30)])
+                    .header(Row::new(vec!["OID", "Old Value", "New Value", "Possible Meaning"]).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+                    .block(Block::default().borders(Borders::ALL).title("UPS OID Identification (Diff Results)")), main_chunks[1]);
+            }
+        } else {
+            f.render_widget(diff_table, main_chunks[1]);
+        }
+    }
 
     // 3. Scan progress
     if app.is_scanning {
@@ -473,9 +688,10 @@ fn ui(f: &mut Frame, app: &App) {
 
     // 4. Status bar
     let help_msg = match app.input_mode {
-        InputMode::Normal => "q: quit | e: edit | s: scan | r: refresh | Arrows: select",
+        InputMode::Normal => "q: quit | e: edit | s: scan | r: refresh | u: ups prober | Arrows: select",
         InputMode::EditingIP => "Enter: submit | Esc: cancel",
-        _ => "Scanning... Please wait",
+        InputMode::UpsProbing => "1: Snapshot A | 2: Snapshot B | c: Clear | Esc: back",
+        _ => "Processing... Please wait",
     };
     
     let footer_text = format!("{} | Status: {}", help_msg, app.status);
