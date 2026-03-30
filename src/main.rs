@@ -145,6 +145,7 @@ impl App {
             let timeout = Duration::from_millis(cfg.6);
             let oids = [(".1.3.6.1.2.1.1.1.0", "Desc"), (".1.3.6.1.2.1.1.3.0", "Up"), (".1.3.6.1.2.1.1.5.0", "Name"), (".1.3.6.1.2.1.1.6.0", "Location")];
             let mut results = Vec::new();
+
             if !cfg.0.is_empty() {
                 let security = Security::new(cfg.0.as_bytes(), cfg.1.as_bytes()).with_auth_protocol(cfg.3).with_auth(Auth::AuthPriv { cipher: Cipher::Aes128, privacy_password: cfg.2.as_bytes().to_vec() });
                 if let Ok(mut session) = SyncSession::new_v3(&agent_addr, Some(timeout), 2, security) {
@@ -156,6 +157,7 @@ impl App {
                     }
                 }
             }
+
             if results.is_empty() {
                 if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, cfg.4.as_bytes(), Some(timeout), 2) {
                     for (oid_str, label) in oids.iter() {
@@ -166,8 +168,16 @@ impl App {
                     }
                 }
             }
+
             if !results.is_empty() { let _ = tx.send(ScanMessage::MetricUpdated(results)); }
-            if let Ok(Some(dev)) = ups::identify_ups(&agent_addr, &cfg.4).await { let _ = tx.send(ScanMessage::UpsIdentified(dev)); }
+
+            // Step 2: Identification (Supports V3)
+            let dev_res = if !cfg.0.is_empty() { 
+                ups::identify_ups_v3(&agent_addr, &cfg.0, &cfg.1, &cfg.2, cfg.3).await 
+            } else { 
+                ups::identify_ups_v2(&agent_addr, &cfg.4).await 
+            };
+            if let Ok(Some(dev)) = dev_res { let _ = tx.send(ScanMessage::UpsIdentified(dev)); }
         });
     }
 
@@ -216,17 +226,17 @@ impl App {
                             if !cfg.0.is_empty() {
                                 let security = Security::new(cfg.0.as_bytes(), cfg.1.as_bytes()).with_auth_protocol(cfg.3).with_auth(Auth::AuthPriv { cipher: Cipher::Aes128, privacy_password: cfg.2.as_bytes().to_vec() });
                                 if let Ok(mut session) = SyncSession::new_v3(&agent_addr, Some(timeout), 2, security) {
-                                    if let Ok(resp) = session.get(&oid) { if let Some(vb) = resp.varbinds.into_iter().next() { return Some(format!("{:?}", vb.1)); } }
+                                    if let Ok(resp) = session.get(&oid) { if let Some(vb) = resp.varbinds.into_iter().next() { return Some(clean_snmp_value(&vb.1)); } }
                                 }
                             }
                             // 2. Try SNMP V2c
                             if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, cfg.4.as_bytes(), Some(timeout), 2) {
-                                if let Ok(resp) = session.get(&oid) { if let Some(vb) = resp.varbinds.into_iter().next() { return Some(format!("{:?}", vb.1)); } }
+                                if let Ok(resp) = session.get(&oid) { if let Some(vb) = resp.varbinds.into_iter().next() { return Some(clean_snmp_value(&vb.1)); } }
                             }
                             // 3. Port Scan Fallback (Web)
                             for port in [80, 443] {
                                 if std::net::TcpStream::connect_timeout(&format!("{}:{}", ip_clone, port).parse().ok()?, Duration::from_millis(500)).is_ok() { 
-                                    return Some(format!("Web Panel (Port {})", port)); 
+                                    return Some(format!("Web (Port {})", port)); 
                                 }
                             }
                             None
@@ -248,13 +258,21 @@ impl App {
         if self.is_walking { return; }
         self.is_walking = true;
         let ip = self.discovered_devices[self.selected_index].ip.clone();
-        let community = self.config.community.clone();
+        let cfg = (self.config.v3_user.clone(), self.config.v3_auth_pass.clone(), self.config.v3_priv_pass.clone(), self.config.v3_auth_protocol, self.config.community.clone());
+        
         tokio::spawn(async move {
             let addr = format!("{}:161", ip);
-            if let Ok(data) = ups::snmp_walk(&addr, &community, &[1, 3, 6, 1, 2, 1]).await {
+            let root = [1, 3, 6, 1, 2, 1];
+            let res = if !cfg.0.is_empty() {
+                ups::snmp_walk_v3(&addr, &cfg.0, &cfg.1, &cfg.2, cfg.3, &root).await
+            } else {
+                ups::snmp_walk_v2(&addr, &cfg.4, &root).await
+            };
+            
+            if let Ok(data) = res {
                 let snap = OidSnapshot { _timestamp: Instant::now(), data };
                 let _ = tx.send(ScanMessage::UpsResult(snap, is_second));
-            } else { let _ = tx.send(ScanMessage::Status("Walk Failed".to_string())); }
+            } else { let _ = tx.send(ScanMessage::Status("Analysis Failed".to_string())); }
         });
     }
 }
