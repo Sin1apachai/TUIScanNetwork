@@ -43,6 +43,7 @@ pub struct Config {
     pub concurrency: usize,
     pub probe_ports: Vec<u16>,
     pub custom_communities: Vec<String>,
+    pub v3_auth_protocol: AuthProtocol, // ADDED
 }
 
 impl Default for Config {
@@ -54,6 +55,7 @@ impl Default for Config {
             concurrency: 60,
             probe_ports: vec![80, 443, 445, 22],
             custom_communities: vec!["public".to_string(), "private".to_string(), "ERXUPS".to_string()],
+            v3_auth_protocol: AuthProtocol::Sha1,
         }
     }
 }
@@ -125,7 +127,7 @@ impl App {
 
     fn select_next(&mut self, tx: Sender<ScanMessage>) {
         if self.show_config {
-            self.selected_config_idx = (self.selected_config_idx + 1) % 8; // UPDATED MENU COUNT
+            self.selected_config_idx = (self.selected_config_idx + 1) % 9; // UPDATED
             return;
         }
         if self.discovered_devices.is_empty() { return; }
@@ -141,7 +143,7 @@ impl App {
 
     fn select_previous(&mut self, tx: Sender<ScanMessage>) {
         if self.show_config {
-            self.selected_config_idx = if self.selected_config_idx == 0 { 7 } else { self.selected_config_idx - 1 };
+            self.selected_config_idx = if self.selected_config_idx == 0 { 8 } else { self.selected_config_idx - 1 };
             return;
         }
         if self.discovered_devices.is_empty() { return; }
@@ -165,6 +167,7 @@ impl App {
         let v3_user = self.v3_user.clone();
         let v3_auth = self.v3_auth_pass.clone();
         let v3_priv = self.v3_priv_pass.clone();
+        let auth_proto = self.config.v3_auth_protocol; // USE CONFIG
         let snmp_port = self.config.snmp_port;
         let timeout = Duration::from_millis(self.config.timeout_ms);
 
@@ -182,7 +185,7 @@ impl App {
             // Try SNMP v3 
             if v3_enabled {
                 let security = Security::new(v3_user.as_bytes(), v3_auth.as_bytes())
-                    .with_auth_protocol(AuthProtocol::Sha1)
+                    .with_auth_protocol(auth_proto)
                     .with_auth(Auth::AuthPriv {
                         cipher: Cipher::Aes128,
                         privacy_password: v3_priv.as_bytes().to_vec(),
@@ -268,6 +271,7 @@ impl App {
         let v3_user = self.v3_user.clone();
         let v3_auth = self.v3_auth_pass.clone();
         let v3_priv = self.v3_priv_pass.clone();
+        let auth_proto = self.config.v3_auth_protocol;
         let snmp_port = self.config.snmp_port;
         let timeout_ms = self.config.timeout_ms;
         let concurrency = self.config.concurrency;
@@ -310,7 +314,7 @@ impl App {
                     let sem_clone = semaphore.clone();
                     let probe_ports = probe_ports.clone();
                     
-                    let v3_cfg = (v3_enabled, v3_user.clone(), v3_auth.clone(), v3_priv.clone());
+                    let v3_cfg = (v3_enabled, v3_user.clone(), v3_auth.clone(), v3_priv.clone(), auth_proto);
 
                     tokio::spawn(async move {
                         let _permit = sem_clone.acquire().await.unwrap();
@@ -324,7 +328,7 @@ impl App {
                             // v3
                             if v3_cfg.0 {
                                 let security = Security::new(v3_cfg.1.as_bytes(), v3_cfg.2.as_bytes())
-                                    .with_auth_protocol(AuthProtocol::Sha1)
+                                    .with_auth_protocol(v3_cfg.4)
                                     .with_auth(Auth::AuthPriv {
                                         cipher: Cipher::Aes128,
                                         privacy_password: v3_cfg.3.as_bytes().to_vec(),
@@ -338,7 +342,7 @@ impl App {
                                     }
                                 }
                             }
-                            // v2c
+                            // v2c fallback
                             if snmp_res.is_none() {
                                 if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, community.as_bytes(), Some(timeout), 1) {
                                     if let Ok(resp) = session.get(&sys_descr_oid) {
@@ -482,6 +486,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, tx: Send
                                 5 => app.v3_user = app.temp_input.clone(),
                                 6 => app.v3_auth_pass = app.temp_input.clone(),
                                 7 => app.v3_priv_pass = app.temp_input.clone(),
+                                8 => {
+                                    if app.temp_input.to_uppercase() == "MD5" { app.config.v3_auth_protocol = AuthProtocol::Md5; }
+                                    else if app.temp_input.to_uppercase() == "SHA" || app.temp_input.to_uppercase() == "SHA1" { app.config.v3_auth_protocol = AuthProtocol::Sha1; }
+                                }
                                 _ => {}
                             }
                             app.edit_mode = EditMode::None;
@@ -557,9 +565,13 @@ fn draw(f: &mut Frame, app: &mut App) {
         f.render_widget(Gauge::default().gauge_style(Style::default().fg(Color::Yellow)).percent(p), chunks[1]);
     }
     render_status(f, app, chunks[2]);
-    if let EditMode::ConfigValue(_) = app.edit_mode {
+    if let EditMode::ConfigValue(idx) = app.edit_mode {
         let area = centered_rect(60, 20, f.area());
-        let input = Paragraph::new(app.temp_input.as_str()).block(Block::default().borders(Borders::ALL).title("Enter New Value")).style(Style::default().fg(Color::Yellow));
+        let help = match idx {
+            8 => "Type 'MD5' or 'SHA' to change protocol",
+            _ => "Enter New Value",
+        };
+        let input = Paragraph::new(app.temp_input.as_str()).block(Block::default().borders(Borders::ALL).title(help)).style(Style::default().fg(Color::Yellow));
         f.render_widget(ratatui::widgets::Clear, area);
         f.render_widget(input, area);
     } else if app.edit_mode != EditMode::None {
@@ -571,6 +583,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn render_config_page(f: &mut Frame, app: &App, area: Rect) {
+    let auth_str = match app.config.v3_auth_protocol { AuthProtocol::Md5 => "MD5", AuthProtocol::Sha1 => "SHA1", _ => "OTHER" };
     let items = vec![
         ("SNMP Port", app.config.snmp_port.to_string()),
         ("Trap Port", app.config.trap_port.to_string()),
@@ -578,8 +591,9 @@ fn render_config_page(f: &mut Frame, app: &App, area: Rect) {
         ("Concurrency", app.config.concurrency.to_string()),
         ("SNMP Community", app.community.clone()),
         ("V3 Username", app.v3_user.clone()),
-        ("V3 Auth Pass", app.v3_auth_pass.clone()), // Added Auth Pass
-        ("V3 Priv Pass", app.v3_priv_pass.clone()), // Added Priv Pass
+        ("V3 Auth Pass", app.v3_auth_pass.clone()),
+        ("V3 Priv Pass", app.v3_priv_pass.clone()),
+        ("V3 Auth Proto", auth_str.to_string()), // NEW
     ];
 
     let rows: Vec<Row> = items.iter().enumerate().map(|(i, (k, v))| {
@@ -588,7 +602,7 @@ fn render_config_page(f: &mut Frame, app: &App, area: Rect) {
     }).collect();
 
     let table = Table::new(rows, [Constraint::Percentage(50), Constraint::Percentage(50)])
-        .block(Block::default().borders(Borders::ALL).title("Config Center - Use Arrows to select, Enter to edit, 'c' to exit"))
+        .block(Block::default().borders(Borders::ALL).title("Config Center - Select Protocol with Enter and type MD5 or SHA"))
         .header(Row::new(vec!["Setting", "Value"]).style(Style::default().fg(Color::Yellow)));
 
     f.render_widget(table, area);
