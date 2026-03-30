@@ -12,6 +12,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use snmp2::{SyncSession, Oid};
+use snmp2::v3::{Security, Auth, AuthProtocol, Cipher};
 use std::{
     io,
     sync::mpsc::{self, Receiver, Sender},
@@ -21,9 +22,18 @@ use chrono::Local;
 
 mod ups;
 mod device;
-use ups::{OidSnapshot, DiffResult, DefaultUprober, UpsDevice};
+use ups::{OidSnapshot, DiffResult, UpsDevice};
 use device::{DeviceCategory, DeviceInfo};
 use network_interface::{NetworkInterface, NetworkInterfaceConfig};
+
+#[derive(PartialEq)]
+pub enum EditMode {
+    None,
+    Community,
+    V3User,
+    V3Auth,
+    V3Priv,
+}
 
 pub struct App {
     pub discovered_devices: Vec<DeviceInfo>,
@@ -41,8 +51,14 @@ pub struct App {
     pub diff_results: Vec<DiffResult>,
     pub is_walking: bool,
     pub identified_ups: Option<UpsDevice>,
-    pub is_editing_community: bool,
-    pub temp_community: String,
+    pub edit_mode: EditMode,
+    pub temp_input: String,
+
+    // SNMP v3 Fields
+    pub v3_enabled: bool,
+    pub v3_user: String,
+    pub v3_auth_pass: String,
+    pub v3_priv_pass: String,
 }
 
 impl App {
@@ -63,8 +79,12 @@ impl App {
             diff_results: Vec::new(),
             is_walking: false,
             identified_ups: None,
-            is_editing_community: false,
-            temp_community: String::new(),
+            edit_mode: EditMode::None,
+            temp_input: String::new(),
+            v3_enabled: false,
+            v3_user: String::new(),
+            v3_auth_pass: String::new(),
+            v3_priv_pass: String::new(),
         }
     }
 
@@ -74,6 +94,11 @@ impl App {
         let ip = self.discovered_devices[self.selected_index].ip.clone();
         let community = self.community.clone();
         
+        let v3_enabled = self.v3_enabled;
+        let v3_user = self.v3_user.clone();
+        let v3_auth = self.v3_auth_pass.clone();
+        let v3_priv = self.v3_priv_pass.clone();
+
         tokio::spawn(async move {
             let agent_addr = format!("{}:161", ip);
             let timeout = Duration::from_secs(2);
@@ -85,13 +110,40 @@ impl App {
             ];
 
             let mut results = Vec::new();
-            if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, community.as_bytes(), Some(timeout), 0) {
-                for (oid_str, label) in oids.iter() {
-                    let parts: Vec<u64> = oid_str.split('.').filter(|s| !s.is_empty()).map(|s| s.parse::<u64>().unwrap_or(0)).collect();
-                    if let Ok(oid) = Oid::from(&parts[..]) {
-                        if let Ok(response) = session.get(&oid) {
-                            if let Some(varbind) = response.varbinds.into_iter().next() {
-                                results.push((label.to_string(), format!("{:?}", varbind.1)));
+
+            // Try SNMP v3 if enabled
+            if v3_enabled {
+                let security = Security::new(v3_user.as_bytes(), v3_auth.as_bytes())
+                    .with_auth_protocol(AuthProtocol::Sha1)
+                    .with_auth(Auth::AuthPriv {
+                        cipher: Cipher::Aes128,
+                        privacy_password: v3_priv.as_bytes().to_vec(),
+                    });
+                
+                if let Ok(mut session) = SyncSession::new_v3(&agent_addr, Some(timeout), 0, security) {
+                    for (oid_str, label) in oids.iter() {
+                        let parts: Vec<u64> = oid_str.split('.').filter(|s| !s.is_empty()).map(|s| s.parse::<u64>().unwrap_or(0)).collect();
+                        if let Ok(oid) = Oid::from(&parts[..]) {
+                            if let Ok(response) = session.get(&oid) {
+                                if let Some(varbind) = response.varbinds.into_iter().next() {
+                                    results.push((label.to_string(), format!("{:?}", varbind.1)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fallback to v2c/v1 if v3 failed or disabled
+            if results.is_empty() {
+                if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, community.as_bytes(), Some(timeout), 0) {
+                    for (oid_str, label) in oids.iter() {
+                        let parts: Vec<u64> = oid_str.split('.').filter(|s| !s.is_empty()).map(|s| s.parse::<u64>().unwrap_or(0)).collect();
+                        if let Ok(oid) = Oid::from(&parts[..]) {
+                            if let Ok(response) = session.get(&oid) {
+                                if let Some(varbind) = response.varbinds.into_iter().next() {
+                                    results.push((label.to_string(), format!("{:?}", varbind.1)));
+                                }
                             }
                         }
                     }
@@ -115,7 +167,7 @@ impl App {
             if !results.is_empty() {
                 let _ = tx.send(ScanMessage::MetricUpdated(results));
             } else {
-                let _ = tx.send(ScanMessage::Status(format!("No response with '{}'", community)));
+                let _ = tx.send(ScanMessage::Status("No response".to_string()));
             }
         });
     }
@@ -141,7 +193,12 @@ impl App {
         self.scan_progress = 0;
         self.scan_total = 0;
         let community = self.community.clone();
-        self.status = format!("Scanning with '{}'...", community);
+        let v3_enabled = self.v3_enabled;
+        let v3_user = self.v3_user.clone();
+        let v3_auth = self.v3_auth_pass.clone();
+        let v3_priv = self.v3_priv_pass.clone();
+        
+        self.status = "Scanning...".to_string();
         
         tokio::spawn(async move {
             let interfaces = NetworkInterface::show().unwrap_or_default();
@@ -160,33 +217,55 @@ impl App {
             }
 
             let total_ips = (scan_targets.len() * 254) as u32;
-            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(50));
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(30)); 
             for subnet_prefix in scan_targets {
                 for i in 1..=254 {
                     let ip = format!("{}.{}", subnet_prefix, i);
                     let community = community.clone();
                     let tx = tx.clone();
                     let sem_clone = semaphore.clone();
+                    
+                    let v3_cfg = (v3_enabled, v3_user.clone(), v3_auth.clone(), v3_priv.clone());
+
                     tokio::spawn(async move {
                         let _permit = sem_clone.acquire().await.unwrap();
                         let agent_addr = format!("{}:161", ip);
                         let ip_for_blocking = ip.clone();
                         let result = tokio::task::spawn_blocking(move || {
                             let sys_descr_oid = Oid::from(&[1, 3, 6, 1, 2, 1, 1, 1, 0]).unwrap();
-                            let sys_object_id = Oid::from(&[1, 3, 6, 1, 2, 1, 1, 2, 0]).unwrap();
-                            let timeout = Duration::from_secs(4);
+                            let timeout = Duration::from_secs(2);
                             let mut snmp_res = None;
-                            if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, community.as_bytes(), Some(timeout), 0) {
-                                if let Ok(resp) = session.get(&sys_descr_oid) {
-                                    if let Some(vb) = resp.varbinds.into_iter().next() {
-                                        let desc = format!("{:?}", vb.1);
-                                        let obj_id = if let Ok(resp2) = session.get(&sys_object_id) {
-                                            if let Some(vb2) = resp2.varbinds.into_iter().next() { format!("{:?}", vb2.1) } else { "".to_string() }
-                                        } else { "".to_string() };
-                                        snmp_res = Some((device::identify_category(&desc, &obj_id), desc));
+                            
+                            // 1. Try v3
+                            if v3_cfg.0 {
+                                let security = Security::new(v3_cfg.1.as_bytes(), v3_cfg.2.as_bytes())
+                                    .with_auth_protocol(AuthProtocol::Sha1)
+                                    .with_auth(Auth::AuthPriv {
+                                        cipher: Cipher::Aes128,
+                                        privacy_password: v3_cfg.3.as_bytes().to_vec(),
+                                    });
+                                if let Ok(mut session) = SyncSession::new_v3(&agent_addr, Some(timeout), 0, security) {
+                                    if let Ok(resp) = session.get(&sys_descr_oid) {
+                                        if let Some(vb) = resp.varbinds.into_iter().next() {
+                                            let desc = format!("{:?}", vb.1);
+                                            snmp_res = Some((device::identify_category(&desc, ""), desc));
+                                        }
                                     }
                                 }
                             }
+                            
+                            // 2. Try v2c
+                            if snmp_res.is_none() {
+                                if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, community.as_bytes(), Some(timeout), 0) {
+                                    if let Ok(resp) = session.get(&sys_descr_oid) {
+                                        if let Some(vb) = resp.varbinds.into_iter().next() {
+                                            let desc = format!("{:?}", vb.1);
+                                            snmp_res = Some((device::identify_category(&desc, ""), desc));
+                                        }
+                                    }
+                                }
+                            }
+                            // 3. Fallback v1
                             if snmp_res.is_none() {
                                 if let Ok(mut session) = SyncSession::new_v1(&agent_addr, community.as_bytes(), Some(timeout), 0) {
                                     if let Ok(resp) = session.get(&sys_descr_oid) {
@@ -198,13 +277,10 @@ impl App {
                                 }
                             }
                             if let Some(res) = snmp_res { return Some(res); }
-                            let common_ports = [80, 443, 22, 161, 8080];
-                            for port in common_ports {
-                                let addr = format!("{}:{}", ip_for_blocking, port);
-                                if let Ok(_) = std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(2)) {
-                                    let cat = match port { 80|443|8080 => DeviceCategory::WebDevice, 22 => DeviceCategory::SSH, _ => DeviceCategory::Alive };
-                                    return Some((cat, format!("Port {}", port)));
-                                }
+                            
+                            let addr = format!("{}:80", ip_for_blocking);
+                            if let Ok(_) = std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(1)) {
+                                return Some((DeviceCategory::WebDevice, "Port 80".to_string()));
                             }
                             None
                         }).await.unwrap_or(None);
@@ -216,6 +292,26 @@ impl App {
                     });
                 }
             }
+        });
+    }
+
+    fn start_community_guess(&mut self, tx: Sender<ScanMessage>) {
+        if self.discovered_devices.is_empty() { return; }
+        let ip = self.discovered_devices[self.selected_index].ip.clone();
+        self.status = format!("Guessing for {}...", ip);
+        tokio::spawn(async move {
+            let common = ["public", "private", "admin", "monitor", "internal", "snmp", "read", "manager", "1234"];
+            let addr = format!("{}:161", ip);
+            let oid = Oid::from(&[1, 3, 6, 1, 2, 1, 1, 1, 0]).unwrap();
+            for community in common {
+                if let Ok(mut session) = SyncSession::new_v2c(&addr, community.as_bytes(), Some(Duration::from_millis(800)), 0) {
+                    if session.get(&oid).is_ok() { let _ = tx.send(ScanMessage::CommunityGuessed(community.to_string())); return; }
+                }
+                if let Ok(mut session) = SyncSession::new_v1(&addr, community.as_bytes(), Some(Duration::from_millis(800)), 0) {
+                    if session.get(&oid).is_ok() { let _ = tx.send(ScanMessage::CommunityGuessed(community.to_string())); return; }
+                }
+            }
+            let _ = tx.send(ScanMessage::Status("Guessing failed".to_string()));
         });
     }
 
@@ -231,17 +327,8 @@ impl App {
             if let Ok(data) = ups::snmp_walk(&addr, &community, &root_oid).await {
                 let snapshot = OidSnapshot { _timestamp: Instant::now(), data };
                 let _ = tx.send(ScanMessage::UpsResult(snapshot, is_second));
-            } else {
-                let _ = tx.send(ScanMessage::Status("Walk failed".to_string()));
-            }
+            } else { let _ = tx.send(ScanMessage::Status("Walk failed".to_string())); }
         });
-    }
-
-    fn calculate_diffs(&mut self) {
-        if let (Some(a), Some(b)) = (&self.snapshot_a, &self.snapshot_b) {
-            let prober = DefaultUprober;
-            self.diff_results = ups::diff_snapshots(a, b, &prober);
-        }
     }
 }
 
@@ -252,6 +339,7 @@ enum ScanMessage {
     UpsResult(OidSnapshot, bool),
     UpsIdentified(UpsDevice),
     MetricUpdated(Vec<(String, String)>),
+    CommunityGuessed(String),
 }
 
 #[tokio::main]
@@ -259,8 +347,7 @@ async fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     let (tx, rx) = mpsc::channel();
     let mut app = App::new();
     let res = run_app(&mut terminal, &mut app, tx, rx).await;
@@ -277,19 +364,19 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, tx: Send
                 ScanMessage::Progress(delta, total) => {
                     app.scan_progress += delta;
                     app.scan_total = total;
-                    if app.scan_progress >= total { app.is_scanning = false; app.status = format!("Done: found {}", app.discovered_devices.len()); }
+                    if app.scan_progress >= total { app.is_scanning = false; app.status = "Scan done".to_string(); }
                 }
                 ScanMessage::Discovered(info) => { if !app.discovered_ips.contains(&info.ip) { app.discovered_ips.push(info.ip.clone()); app.discovered_devices.push(info); } }
                 ScanMessage::Status(s) => app.status = s,
                 ScanMessage::UpsResult(snapshot, is_second) => {
                     app.is_walking = false;
-                    if is_second { app.snapshot_b = Some(snapshot); app.calculate_diffs(); app.status = format!("Diff: {} changes", app.diff_results.len()); }
-                    else { app.snapshot_a = Some(snapshot); app.status = "Snap A OK. Press '2' later.".to_string(); }
+                    if is_second { app.snapshot_b = Some(snapshot); app.status = "Diff calculated".to_string(); }
+                    else { app.snapshot_a = Some(snapshot); app.status = "Snap A OK".to_string(); }
                 }
                 ScanMessage::UpsIdentified(device) => app.identified_ups = Some(device),
                 ScanMessage::MetricUpdated(data) => {
                     app.snmp_data = data;
-                    app.status = format!("Updated at {}", Local::now().format("%H:%M:%S"));
+                    app.status = format!("Details updated at {}", Local::now().format("%H:%M:%S"));
                     if !app.discovered_devices.is_empty() {
                         if let Some(desc) = app.snmp_data.iter().find(|(l, _)| l.contains("Description")).map(|(_, v)| v.clone()) {
                             let new_cat = device::identify_category(&desc, "");
@@ -297,31 +384,44 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, tx: Send
                         }
                     }
                 }
+                ScanMessage::CommunityGuessed(comm) => { app.community = comm; app.status = "FOUND!".to_string(); app.start_snmp_update(tx.clone()); }
             }
         }
         terminal.draw(|f| draw(f, app)).map_err(|e| anyhow!("Draw error: {:?}", e))?;
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if app.is_editing_community {
+                if app.edit_mode != EditMode::None {
                     match key.code {
-                        KeyCode::Enter => { app.community = app.temp_community.clone(); app.is_editing_community = false; app.status = format!("Community set to '{}'", app.community); }
-                        KeyCode::Esc => { app.is_editing_community = false; }
-                        KeyCode::Char(c) => { app.temp_community.push(c); }
-                        KeyCode::Backspace => { app.temp_community.pop(); }
+                        KeyCode::Enter => {
+                            match app.edit_mode {
+                                EditMode::Community => app.community = app.temp_input.clone(),
+                                EditMode::V3User => app.v3_user = app.temp_input.clone(),
+                                EditMode::V3Auth => app.v3_auth_pass = app.temp_input.clone(),
+                                EditMode::V3Priv => app.v3_priv_pass = app.temp_input.clone(),
+                                _ => {}
+                            }
+                            app.edit_mode = EditMode::None;
+                            app.status = "Setting saved".to_string();
+                        }
+                        KeyCode::Esc => app.edit_mode = EditMode::None,
+                        KeyCode::Char(c) => app.temp_input.push(c),
+                        KeyCode::Backspace => { app.temp_input.pop(); },
                         _ => {}
                     }
                 } else {
                     match key.code {
                         KeyCode::Char('q') => return Ok(()),
                         KeyCode::Char('s') => app.start_scan(tx.clone()),
-                        KeyCode::Char('i') => { app.is_editing_community = true; app.temp_community = String::new(); }
+                        KeyCode::Char('g') => app.start_community_guess(tx.clone()),
                         KeyCode::Char('r') => { app.start_snmp_update(tx.clone()); app.trigger_ups_identification(tx.clone()); }
                         KeyCode::Char('u') => app.show_uprober = !app.show_uprober,
-                        KeyCode::Down => if !app.discovered_devices.is_empty() { app.selected_index = (app.selected_index + 1) % app.discovered_devices.len(); app.start_snmp_update(tx.clone()); app.trigger_ups_identification(tx.clone()); }
-                        KeyCode::Up => if !app.discovered_devices.is_empty() { app.selected_index = if app.selected_index > 0 { app.selected_index - 1 } else { app.discovered_devices.len() - 1 }; app.start_snmp_update(tx.clone()); app.trigger_ups_identification(tx.clone()); }
-                        KeyCode::Char('1') if app.show_uprober => app.start_ups_walk(false, tx.clone()),
-                        KeyCode::Char('2') if app.show_uprober => app.start_ups_walk(true, tx.clone()),
-                        KeyCode::Char('c') if app.show_uprober => { app.snapshot_a = None; app.snapshot_b = None; app.diff_results.clear(); }
+                        KeyCode::Char('i') => { app.edit_mode = EditMode::Community; app.temp_input = app.community.clone(); }
+                        KeyCode::Char('v') => app.v3_enabled = !app.v3_enabled,
+                        KeyCode::Char('U') => { app.edit_mode = EditMode::V3User; app.temp_input = app.v3_user.clone(); }
+                        KeyCode::Char('A') => { app.edit_mode = EditMode::V3Auth; app.temp_input = app.v3_auth_pass.clone(); }
+                        KeyCode::Char('P') => { app.edit_mode = EditMode::V3Priv; app.temp_input = app.v3_priv_pass.clone(); }
+                        KeyCode::Down => if !app.discovered_devices.is_empty() { app.selected_index = (app.selected_index + 1) % app.discovered_devices.len(); app.start_snmp_update(tx.clone()); }
+                        KeyCode::Up => if !app.discovered_devices.is_empty() { app.selected_index = if app.selected_index > 0 { app.selected_index - 1 } else { app.discovered_devices.len() - 1 }; app.start_snmp_update(tx.clone()); }
                         _ => {}
                     }
                 }
@@ -336,44 +436,41 @@ fn draw(f: &mut Frame, app: &mut App) {
     render_device_list(f, app, main_chunk[0]);
     render_details(f, app, main_chunk[1]);
     if app.is_scanning {
-        let percentage = if app.scan_total > 0 { ((app.scan_progress as f32 / app.scan_total as f32) * 100.0) as u16 } else { 0 };
-        f.render_widget(Gauge::default().gauge_style(Style::default().fg(Color::Yellow)).percent(percentage), chunks[1]);
+        let p = if app.scan_total > 0 { ((app.scan_progress as f32 / app.scan_total as f32) * 100.0) as u16 } else { 0 };
+        f.render_widget(Gauge::default().gauge_style(Style::default().fg(Color::Yellow)).percent(p), chunks[1]);
     }
     render_status(f, app, chunks[2]);
-    if app.is_editing_community {
+    if app.edit_mode != EditMode::None {
         let area = centered_rect(60, 20, f.area());
-        let input = Paragraph::new(app.temp_community.as_str()).block(Block::default().borders(Borders::ALL).title("Enter Community Name (Enter to Save, Esc to Cancel)")).style(Style::default().fg(Color::Yellow));
+        let title = match app.edit_mode { EditMode::Community => "Community Name", EditMode::V3User => "V3 Username", EditMode::V3Auth => "V3 Auth Pass (SHA1)", EditMode::V3Priv => "V3 Priv Pass (AES128)", _ => "" };
+        let input = Paragraph::new(app.temp_input.as_str()).block(Block::default().borders(Borders::ALL).title(title)).style(Style::default().fg(Color::Yellow));
         f.render_widget(ratatui::widgets::Clear, area);
         f.render_widget(input, area);
     }
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default().direction(Direction::Vertical).constraints([Constraint::Percentage((100 - percent_y) / 2), Constraint::Percentage(percent_y), Constraint::Percentage((100 - percent_y) / 2)]).split(r);
-    Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage((100 - percent_x) / 2), Constraint::Percentage(percent_x), Constraint::Percentage((100 - percent_x) / 2)]).split(popup_layout[1])[1]
+fn centered_rect(px: u16, py: u16, r: Rect) -> Rect {
+    let popup = Layout::default().direction(Direction::Vertical).constraints([Constraint::Percentage((100 - py) / 2), Constraint::Percentage(py), Constraint::Percentage((100 - py) / 2)]).split(r);
+    Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage((100 - px) / 2), Constraint::Percentage(px), Constraint::Percentage((100 - px) / 2)]).split(popup[1])[1]
 }
 
 fn render_device_list(f: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<Row> = app.discovered_devices.iter().enumerate().map(|(i, d)| {
-        let color = match d.category { DeviceCategory::UPS => Color::LightRed, DeviceCategory::RouterSwitch => Color::Cyan, DeviceCategory::Printer => Color::Green, DeviceCategory::NAS => Color::Yellow, DeviceCategory::WebDevice => Color::Green, DeviceCategory::SSH => Color::Magenta, _ => Color::White };
+    let rows: Vec<Row> = app.discovered_devices.iter().enumerate().map(|(i, d)| {
+        let color = match d.category { DeviceCategory::UPS => Color::LightRed, DeviceCategory::RouterSwitch => Color::Cyan, DeviceCategory::Printer => Color::Green, DeviceCategory::NAS => Color::Yellow, _ => Color::White };
         let style = if i == app.selected_index { Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(color) };
         Row::new(vec![Cell::from(format!("{} {}", d.category, d.ip))]).style(style)
     }).collect();
-    f.render_widget(Table::new(items, [Constraint::Percentage(100)]).block(Block::default().borders(Borders::ALL).title(format!("Network Map ({})", app.discovered_devices.len()))), area);
+    f.render_widget(Table::new(rows, [Constraint::Percentage(100)]).block(Block::default().borders(Borders::ALL).title("Network Map")), area);
 }
 
 fn render_details(f: &mut Frame, app: &App, area: Rect) {
-    if app.show_uprober {
-        let rows: Vec<Row> = app.diff_results.iter().map(|d| Row::new(vec![Cell::from(d.oid.clone()), Cell::from(d.old_value.clone()), Cell::from(d.new_value.clone()), Cell::from(d.change_type.clone())]).style(Style::default().fg(Color::Yellow))).collect();
-        f.render_widget(Table::new(rows, [Constraint::Percentage(30), Constraint::Percentage(20), Constraint::Percentage(20), Constraint::Percentage(30)]).header(Row::new(vec!["OID", "Snap A", "Snap B", "Change"]).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))).block(Block::default().borders(Borders::ALL).title("UPS Prober (Delta Mode)")), area);
-    } else {
-        let rows: Vec<Row> = app.snmp_data.iter().map(|(label, value)| Row::new(vec![Cell::from(label.clone()).style(Style::default().add_modifier(Modifier::BOLD)), Cell::from(value.clone())])).collect();
-        let title = match &app.identified_ups { Some(u) => format!("Details [UPS: {} {}]", u.vendor, u.model), None => "Device Details".to_string() };
-        f.render_widget(Table::new(rows, [Constraint::Percentage(40), Constraint::Percentage(60)]).header(Row::new(vec!["Metric", "Value"]).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))).block(Block::default().borders(Borders::ALL).title(title)), area);
-    }
+    let rows: Vec<Row> = app.snmp_data.iter().map(|(l, v)| Row::new(vec![Cell::from(l.clone()).style(Style::default().add_modifier(Modifier::BOLD)), Cell::from(v.clone())])).collect();
+    let title = if app.v3_enabled { format!("Details [V3: {}]", app.v3_user) } else { format!("Details [Comm: {}]", app.community) };
+    f.render_widget(Table::new(rows, [Constraint::Percentage(40), Constraint::Percentage(60)]).header(Row::new(vec!["Metric", "Value"]).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))).block(Block::default().borders(Borders::ALL).title(title)), area);
 }
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
-    let help = if app.is_editing_community { "Type community... | Enter: Save | Esc: Cancel" } else { "q: quit | s: scan | i: set community | r: refresh | u: prober | Arrows: select" };
-    f.render_widget(Paragraph::new(format!("{} | Community: {}", help, app.community)).block(Block::default().borders(Borders::ALL).title(format!("Controls | {}", app.status))), area);
+    let mut help = if app.v3_enabled { "[V3 ACTIVE] i: set comm | v: v2c mode | U: user | A: auth | P: priv".to_string() } else { "[v2c mode] i: set comm | v: v3 mode | g: guess".to_string() };
+    help.push_str(" | s: scan | r: refresh | u: prober | Arrows: select | q: quit");
+    f.render_widget(Paragraph::new(help).block(Block::default().borders(Borders::ALL).title(format!("Mode Selection & Controls | {}", app.status))), area);
 }
