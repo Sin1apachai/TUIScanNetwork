@@ -41,8 +41,10 @@ pub fn identify_category(descr: &str, oid: &str) -> DeviceCategory {
     let desc = descr.to_lowercase();
     let oid_str = oid.to_lowercase();
 
-    // 1. UPS Heuristics
-    if desc.contains("ups") || desc.contains("battery") || 
+    // 1. UPS / Power System Heuristics
+    if desc.contains("ups") || desc.contains("battery") || desc.contains("power") ||
+       desc.contains("backup") || desc.contains("volt") || desc.contains("current") ||
+       desc.contains("ammeter") || desc.contains("pdu") ||
        oid_str.contains(".1.3.6.1.4.1.318") || // APC
        oid_str.contains(".1.3.6.1.4.1.3808") || // CyberPower
        oid_str.contains(".1.3.6.1.2.1.33") { // Standard UPS

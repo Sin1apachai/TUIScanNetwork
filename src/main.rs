@@ -85,8 +85,9 @@ impl App {
                 (".1.3.6.1.2.1.1.6.0", "System Location"),
             ];
 
+            let mut results = Vec::new();
+            // Try v2c
             if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, community.as_bytes(), Some(timeout), 0) {
-                let mut results = Vec::new();
                 for (oid_str, label) in oids.iter() {
                     let parts: Vec<u64> = oid_str.split('.').filter(|s| !s.is_empty()).map(|s| s.parse::<u64>().unwrap_or(0)).collect();
                     if let Ok(oid) = Oid::from(&parts[..]) {
@@ -97,9 +98,28 @@ impl App {
                         }
                     }
                 }
-                if !results.is_empty() {
-                    let _ = tx.send(ScanMessage::MetricUpdated(results));
+            }
+            
+            // Fallback to v1 if no results
+            if results.is_empty() {
+                if let Ok(mut session) = SyncSession::new_v1(&agent_addr, community.as_bytes(), Some(timeout), 0) {
+                    for (oid_str, label) in oids.iter() {
+                        let parts: Vec<u64> = oid_str.split('.').filter(|s| !s.is_empty()).map(|s| s.parse::<u64>().unwrap_or(0)).collect();
+                        if let Ok(oid) = Oid::from(&parts[..]) {
+                            if let Ok(response) = session.get(&oid) {
+                                if let Some(varbind) = response.varbinds.into_iter().next() {
+                                    results.push((label.to_string(), format!("{:?}", varbind.1)));
+                                }
+                            }
+                        }
+                    }
                 }
+            }
+
+            if !results.is_empty() {
+                let _ = tx.send(ScanMessage::MetricUpdated(results));
+            } else {
+                let _ = tx.send(ScanMessage::Status("Device not responding to SNMP v1/v2c (check community)".to_string()));
             }
         });
     }
@@ -168,6 +188,7 @@ impl App {
                             let timeout = Duration::from_secs(5);
 
                             let mut snmp_res = None;
+                            // 1. Try SNMP v2c
                             if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, community.as_bytes(), Some(timeout), 0) {
                                 if let Ok(resp) = session.get(&sys_descr_oid) {
                                     if let Some(vb) = resp.varbinds.into_iter().next() {
@@ -181,6 +202,19 @@ impl App {
                                         snmp_res = Some((cat, desc));
                                     }
                                 }
+                            }
+
+                            // 2. Try SNMP v1 Fallback
+                            if snmp_res.is_none() {
+                                    if let Ok(mut session) = SyncSession::new_v1(&agent_addr, community.as_bytes(), Some(timeout), 0) {
+                                        if let Ok(resp) = session.get(&sys_descr_oid) {
+                                            if let Some(vb) = resp.varbinds.into_iter().next() {
+                                                let desc = format!("{:?}", vb.1);
+                                                let cat = device::identify_category(&desc, "");
+                                                snmp_res = Some((cat, desc));
+                                            }
+                                        }
+                                    }
                             }
 
                             if let Some(res) = snmp_res { return Some(res); }
