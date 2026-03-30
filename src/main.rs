@@ -22,7 +22,7 @@ use chrono::Local;
 
 mod ups;
 mod device;
-use ups::{OidSnapshot, DiffResult, UpsDevice};
+use ups::{OidSnapshot, DiffResult, UpsDevice, DefaultUprober, Uprober};
 use device::{DeviceCategory, DeviceInfo};
 use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 
@@ -322,7 +322,7 @@ impl App {
         let ip = self.discovered_devices[self.selected_index].ip.clone();
         let community = self.community.clone();
         tokio::spawn(async move {
-            let root_oid = [1, 3, 6, 1, 4, 1];
+            let root_oid = [1, 3, 6, 1, 2, 1]; // System MIB and others
             let addr = format!("{}:161", ip);
             if let Ok(data) = ups::snmp_walk(&addr, &community, &root_oid).await {
                 let snapshot = OidSnapshot { _timestamp: Instant::now(), data };
@@ -332,7 +332,7 @@ impl App {
     }
 }
 
-enum ScanMessage {
+pub enum ScanMessage {
     Progress(u32, u32),
     Discovered(DeviceInfo),
     Status(String),
@@ -370,8 +370,18 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, tx: Send
                 ScanMessage::Status(s) => app.status = s,
                 ScanMessage::UpsResult(snapshot, is_second) => {
                     app.is_walking = false;
-                    if is_second { app.snapshot_b = Some(snapshot); app.status = "Diff calculated".to_string(); }
-                    else { app.snapshot_a = Some(snapshot); app.status = "Snap A OK".to_string(); }
+                    if is_second { 
+                        app.snapshot_b = Some(snapshot); 
+                        app.status = "Snapshot B OK".to_string(); 
+                        if let (Some(a), Some(b)) = (&app.snapshot_a, &app.snapshot_b) {
+                            let prober = DefaultUprober;
+                            app.diff_results = ups::diff_snapshots(a, b, &prober);
+                            app.status = format!("Analysis Complete ({} diffs)", app.diff_results.len());
+                        }
+                    } else { 
+                        app.snapshot_a = Some(snapshot); 
+                        app.status = "Snapshot A OK".to_string(); 
+                    }
                 }
                 ScanMessage::UpsIdentified(device) => app.identified_ups = Some(device),
                 ScanMessage::MetricUpdated(data) => {
@@ -414,7 +424,16 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, tx: Send
                         KeyCode::Char('s') => app.start_scan(tx.clone()),
                         KeyCode::Char('g') => app.start_community_guess(tx.clone()),
                         KeyCode::Char('r') => { app.start_snmp_update(tx.clone()); app.trigger_ups_identification(tx.clone()); }
-                        KeyCode::Char('u') => app.show_uprober = !app.show_uprober,
+                        KeyCode::Char('u') => {
+                            app.show_uprober = !app.show_uprober;
+                            if app.show_uprober {
+                                app.snapshot_a = None;
+                                app.snapshot_b = None;
+                                app.diff_results.clear();
+                                app.start_ups_walk(false, tx.clone());
+                            }
+                        }
+                        KeyCode::Char('2') => { if app.show_uprober { app.start_ups_walk(true, tx.clone()); } }
                         KeyCode::Char('i') => { app.edit_mode = EditMode::Community; app.temp_input = app.community.clone(); }
                         KeyCode::Char('v') => app.v3_enabled = !app.v3_enabled,
                         KeyCode::Char('U') => { app.edit_mode = EditMode::V3User; app.temp_input = app.v3_user.clone(); }
@@ -434,7 +453,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Length(3)]).split(f.area());
     let main_chunk = Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage(35), Constraint::Percentage(65)]).split(chunks[0]);
     render_device_list(f, app, main_chunk[0]);
-    render_details(f, app, main_chunk[1]);
+    if app.show_uprober {
+        render_uprober_view(f, app, main_chunk[1]);
+    } else {
+        render_details(f, app, main_chunk[1]);
+    }
     if app.is_scanning {
         let p = if app.scan_total > 0 { ((app.scan_progress as f32 / app.scan_total as f32) * 100.0) as u16 } else { 0 };
         f.render_widget(Gauge::default().gauge_style(Style::default().fg(Color::Yellow)).percent(p), chunks[1]);
@@ -469,8 +492,38 @@ fn render_details(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Table::new(rows, [Constraint::Percentage(40), Constraint::Percentage(60)]).header(Row::new(vec!["Metric", "Value"]).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))).block(Block::default().borders(Borders::ALL).title(title)), area);
 }
 
+fn render_uprober_view(f: &mut Frame, app: &App, area: Rect) {
+    let mut text = vec![
+        Row::new(vec![Cell::from("UPS Intelligence Prober").style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))]),
+        Row::new(vec![Cell::from("-------------------------")]),
+    ];
+
+    if let Some(device) = &app.identified_ups {
+        text.push(Row::new(vec![Cell::from(format!("Vendor: {}", device.vendor))]));
+        text.push(Row::new(vec![Cell::from(format!("Model:  {}", device.model))]));
+    } else {
+        text.push(Row::new(vec![Cell::from("Identifying device...")]));
+    }
+
+    if app.snapshot_a.is_some() {
+        text.push(Row::new(vec![Cell::from("[Step 1] Baseline Captured").style(Style::default().fg(Color::Green))]));
+        if app.snapshot_b.is_none() {
+            text.push(Row::new(vec![Cell::from("Press '2' to capture second snapshot and analyze changes.")]));
+        }
+    } else if app.is_walking {
+        text.push(Row::new(vec![Cell::from("Performing SNMP Walk... please wait...").style(Style::default().fg(Color::Yellow))]));
+    }
+
+    for res in &app.diff_results {
+        let style = if res.meaning.contains("Power") || res.meaning.contains("Load") { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+        text.push(Row::new(vec![Cell::from(format!("• {}: {} -> {}", res.meaning, res.old_val, res.new_val)).style(style)]));
+    }
+
+    f.render_widget(Table::new(text, [Constraint::Percentage(100)]).block(Block::default().borders(Borders::ALL).title("UPS Analysis Mode")), area);
+}
+
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
-    let mut help = if app.v3_enabled { "[V3 ACTIVE] i: set comm | v: v2c mode | U: user | A: auth | P: priv".to_string() } else { "[v2c mode] i: set comm | v: v3 mode | g: guess".to_string() };
-    help.push_str(" | s: scan | r: refresh | u: prober | Arrows: select | q: quit");
-    f.render_widget(Paragraph::new(help).block(Block::default().borders(Borders::ALL).title(format!("Mode Selection & Controls | {}", app.status))), area);
+    let mut help = if app.v3_enabled { "[V3 ACTIVE] i: set comm | v: v2c mode | U/A/P: config".to_string() } else { "[v2c mode] i: set comm | v: v3 mode | g: guess".to_string() };
+    help.push_str(" | s: scan | r: refresh | u: prober | 2: snap2 | Arrows: select | q: quit");
+    f.render_widget(Paragraph::new(help).block(Block::default().borders(Borders::ALL).title(format!("Controls | {}", app.status))), area);
 }
