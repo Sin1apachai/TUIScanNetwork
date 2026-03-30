@@ -47,7 +47,7 @@ impl Default for Config {
         Self {
             snmp_port: 161,
             timeout_ms: 2000,
-            concurrency: 50,
+            concurrency: 60,
             v3_user: String::new(),
             v3_auth_pass: String::new(),
             v3_priv_pass: String::new(),
@@ -138,33 +138,16 @@ impl App {
         if self.discovered_devices.is_empty() { return; }
         self.snmp_data.clear();
         let ip = self.discovered_devices[self.selected_index].ip.clone();
-        
-        let cfg = (
-            self.config.v3_user.clone(),
-            self.config.v3_auth_pass.clone(),
-            self.config.v3_priv_pass.clone(),
-            self.config.v3_auth_protocol,
-            self.config.community.clone(),
-            self.config.snmp_port,
-            self.config.timeout_ms
-        );
+        let cfg = (self.config.v3_user.clone(), self.config.v3_auth_pass.clone(), self.config.v3_priv_pass.clone(), self.config.v3_auth_protocol, self.config.community.clone(), self.config.snmp_port, self.config.timeout_ms);
 
         tokio::spawn(async move {
             let agent_addr = format!("{}:{}", ip, cfg.5);
             let timeout = Duration::from_millis(cfg.6);
-            
-            // Step 1: Basic Info
-            let oids = [
-                (".1.3.6.1.2.1.1.1.0", "Description"),
-                (".1.3.6.1.2.1.1.3.0", "Uptime"),
-                (".1.3.6.1.2.1.1.5.0", "Name"),
-                (".1.3.6.1.2.1.1.6.0", "Location"),
-            ];
-
+            let oids = [(".1.3.6.1.2.1.1.1.0", "Desc"), (".1.3.6.1.2.1.1.3.0", "Up"), (".1.3.6.1.2.1.1.5.0", "Name"), (".1.3.6.1.2.1.1.6.0", "Location")];
             let mut results = Vec::new();
             if !cfg.0.is_empty() {
                 let security = Security::new(cfg.0.as_bytes(), cfg.1.as_bytes()).with_auth_protocol(cfg.3).with_auth(Auth::AuthPriv { cipher: Cipher::Aes128, privacy_password: cfg.2.as_bytes().to_vec() });
-                if let Ok(mut session) = SyncSession::new_v3(&agent_addr, Some(timeout), 1, security) {
+                if let Ok(mut session) = SyncSession::new_v3(&agent_addr, Some(timeout), 2, security) {
                     for (oid_str, label) in oids.iter() {
                         let parts: Vec<u64> = oid_str.split('.').filter(|s| !s.is_empty()).map(|s| s.parse::<u64>().unwrap_or(0)).collect();
                         if let Ok(oid) = Oid::from(&parts[..]) {
@@ -174,7 +157,7 @@ impl App {
                 }
             }
             if results.is_empty() {
-                if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, cfg.4.as_bytes(), Some(timeout), 1) {
+                if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, cfg.4.as_bytes(), Some(timeout), 2) {
                     for (oid_str, label) in oids.iter() {
                         let parts: Vec<u64> = oid_str.split('.').filter(|s| !s.is_empty()).map(|s| s.parse::<u64>().unwrap_or(0)).collect();
                         if let Ok(oid) = Oid::from(&parts[..]) {
@@ -184,8 +167,6 @@ impl App {
                 }
             }
             if !results.is_empty() { let _ = tx.send(ScanMessage::MetricUpdated(results)); }
-
-            // Step 2: Identification
             if let Ok(Some(dev)) = ups::identify_ups(&agent_addr, &cfg.4).await { let _ = tx.send(ScanMessage::UpsIdentified(dev)); }
         });
     }
@@ -195,18 +176,10 @@ impl App {
         self.is_scanning = true;
         self.discovered_devices.clear();
         self.discovered_ips.clear();
-        self.status = "Deep Scanning...".to_string();
+        self.scan_progress = 0;
+        self.status = "Discovery in progress...".to_string();
         
-        let cfg = (
-            self.config.v3_user.clone(),
-            self.config.v3_auth_pass.clone(),
-            self.config.v3_priv_pass.clone(),
-            self.config.v3_auth_protocol,
-            self.config.community.clone(),
-            self.config.snmp_port,
-            self.config.timeout_ms,
-            self.config.concurrency
-        );
+        let cfg = (self.config.v3_user.clone(), self.config.v3_auth_pass.clone(), self.config.v3_priv_pass.clone(), self.config.v3_auth_protocol, self.config.community.clone(), self.config.snmp_port, self.config.timeout_ms, self.config.concurrency);
         
         tokio::spawn(async move {
             let interfaces = NetworkInterface::show().unwrap_or_default();
@@ -222,9 +195,11 @@ impl App {
                 }
             }
 
+            let total_jobs = (scan_targets.len() * 254) as u32;
+            let _ = tx.send(ScanMessage::Status(format!("Scanning {} addresses...", total_jobs)));
+            
             let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(cfg.7));
             for subnet in scan_targets {
-                let _ = tx.send(ScanMessage::Status(format!("Scanning {}.x...", subnet)));
                 for i in 1..=254 {
                     let ip = format!("{}.{}", subnet, i);
                     let tx = tx.clone();
@@ -237,24 +212,31 @@ impl App {
                         let result = tokio::task::spawn_blocking(move || {
                             let oid = Oid::from(&[1, 3, 6, 1, 2, 1, 1, 1, 0]).unwrap();
                             let timeout = Duration::from_millis(cfg.6);
+                            // 1. Try SNMP V3
                             if !cfg.0.is_empty() {
                                 let security = Security::new(cfg.0.as_bytes(), cfg.1.as_bytes()).with_auth_protocol(cfg.3).with_auth(Auth::AuthPriv { cipher: Cipher::Aes128, privacy_password: cfg.2.as_bytes().to_vec() });
-                                if let Ok(mut session) = SyncSession::new_v3(&agent_addr, Some(timeout), 1, security) {
+                                if let Ok(mut session) = SyncSession::new_v3(&agent_addr, Some(timeout), 2, security) {
                                     if let Ok(resp) = session.get(&oid) { if let Some(vb) = resp.varbinds.into_iter().next() { return Some(format!("{:?}", vb.1)); } }
                                 }
                             }
-                            if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, cfg.4.as_bytes(), Some(timeout), 1) {
+                            // 2. Try SNMP V2c
+                            if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, cfg.4.as_bytes(), Some(timeout), 2) {
                                 if let Ok(resp) = session.get(&oid) { if let Some(vb) = resp.varbinds.into_iter().next() { return Some(format!("{:?}", vb.1)); } }
                             }
-                            if std::net::TcpStream::connect_timeout(&format!("{}:80", ip_clone).parse().ok()?, Duration::from_millis(150)).is_ok() { return Some("Web Open".to_string()); }
+                            // 3. Port Scan Fallback (Web)
+                            for port in [80, 443] {
+                                if std::net::TcpStream::connect_timeout(&format!("{}:{}", ip_clone, port).parse().ok()?, Duration::from_millis(500)).is_ok() { 
+                                    return Some(format!("Web Panel (Port {})", port)); 
+                                }
+                            }
                             None
                         }).await.unwrap_or(None);
 
                         if let Some(desc) = result {
-                            let info = DeviceInfo { ip: ip.clone(), category: device::identify_category(&desc, ""), _description: desc, _sys_name: "".to_string() };
+                            let info = DeviceInfo { ip: ip, category: device::identify_category(&desc, ""), _description: desc, _sys_name: "".to_string() };
                             let _ = tx.send(ScanMessage::Discovered(info));
                         }
-                        let _ = tx.send(ScanMessage::Progress(1, 254));
+                        let _ = tx.send(ScanMessage::Progress(1, total_jobs));
                     });
                 }
             }
@@ -309,10 +291,10 @@ where
     loop {
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                ScanMessage::Progress(delta, _total) => { app.scan_progress += delta; if app.scan_progress >= 254 { app.is_scanning = false; app.status = "Scan done".to_string(); } }
+                ScanMessage::Progress(delta, total) => { app.scan_progress += delta; app.scan_total = total; if app.scan_progress >= total { app.is_scanning = false; app.status = "Discovery Finished".to_string(); } }
                 ScanMessage::Discovered(info) => { if !app.discovered_ips.contains(&info.ip) { app.discovered_ips.push(info.ip.clone()); app.discovered_devices.push(info); } }
                 ScanMessage::Status(s) => app.status = s,
-                ScanMessage::MetricUpdated(data) => { app.snmp_data = data; app.status = "Ready".to_string(); }
+                ScanMessage::MetricUpdated(data) => { app.snmp_data = data; app.status = "Metrics Updated".to_string(); }
                 ScanMessage::UpsIdentified(dev) => app.identified_ups = Some(dev),
                 ScanMessage::UpsResult(snap, is_second) => {
                     app.is_walking = false;
@@ -354,7 +336,6 @@ where
                     match key.code {
                         KeyCode::Char('q') => return Ok(()),
                         KeyCode::Char('s') => app.start_scan(tx.clone()),
-                        KeyCode::Char('g') => { if !app.discovered_devices.is_empty() { let ip = app.discovered_devices[app.selected_index].ip.clone(); let port = app.config.snmp_port; let tx = tx.clone(); tokio::spawn(async move { let comms = ["public", "private", "ERXUPS", "admin"]; for c in comms { if let Ok(mut session) = SyncSession::new_v2c(&format!("{}:{}", ip, port), c.as_bytes(), Some(Duration::from_millis(1000)), 1) { if session.get(&Oid::from(&[1, 3, 6, 1, 2, 1, 1, 1, 0]).unwrap()).is_ok() { let _ = tx.send(ScanMessage::CommunityGuessed(c.to_string())); return; } } } }); } }
                         KeyCode::Char('r') => app.start_snmp_update(tx.clone()),
                         KeyCode::Char('c') => app.show_config = !app.show_config,
                         KeyCode::Char('u') => { app.show_uprober = !app.show_uprober; if app.show_uprober { app.snapshot_a = None; app.snapshot_b = None; app.diff_results.clear(); app.start_ups_walk(false, tx.clone()); } }
@@ -383,7 +364,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         if app.show_uprober { render_uprober_view(f, app, main[1]); }
         else { render_details_view(f, app, main[1]); }
     }
-    if app.is_scanning { f.render_widget(Gauge::default().gauge_style(Style::default().fg(Color::Yellow)).percent(((app.scan_progress as f32 / 254.0) * 100.0) as u16), chunks[1]); }
+    if app.is_scanning { 
+        let pct = if app.scan_total > 0 { ((app.scan_progress as f32 / app.scan_total as f32) * 100.0) as u16 } else { 0 };
+        f.render_widget(Gauge::default().gauge_style(Style::default().fg(Color::Yellow)).percent(pct).label(format!("Scanning: {}/{}", app.scan_progress, app.scan_total)), chunks[1]); 
+    }
     render_bottom_bar(f, app, chunks[2]);
 }
 
@@ -396,8 +380,8 @@ fn render_bottom_bar(f: &mut Frame, app: &App, area: Rect) {
             f.render_widget(p, area);
         }
         EditMode::None => {
-            let help = if app.show_config { "ENTER: Edit | c: Close | Arrows: Move" } else { "s: Scan | g: Guess | r: Refresh | c: Config | u: Uprober | q: Quit" };
-            f.render_widget(Paragraph::new(format!(" {} | {}", help, app.status)).block(Block::default().borders(Borders::ALL).title("Controls")), area);
+            let help = if app.show_config { "ENTER: Edit | c: Close | Arrows: Move" } else { "s: Scan | r: Refresh | c: Config | u: Uprober | q: Quit" };
+            f.render_widget(Paragraph::new(format!(" {} | {}", help, app.status)).block(Block::default().borders(Borders::ALL).title("Status Bar")), area);
         }
     }
 }
@@ -419,20 +403,20 @@ fn render_device_list(f: &mut Frame, app: &mut App, area: Rect) {
                     else { if d.category == DeviceCategory::UPS { Style::default().fg(Color::Red) } else { Style::default().fg(Color::White) } };
         Row::new(vec![Cell::from(format!("[{}] {}", d.category, d.ip))]).style(style)
     }).collect();
-    let table = Table::new(rows, [Constraint::Percentage(100)]).block(Block::default().borders(Borders::ALL).title("Network Map"));
+    let table = Table::new(rows, [Constraint::Percentage(100)]).block(Block::default().borders(Borders::ALL).title("Devices Found"));
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
 fn render_details_view(f: &mut Frame, app: &mut App, area: Rect) {
     let rows: Vec<Row> = app.snmp_data.iter().map(|(l, v)| Row::new(vec![Cell::from(l.clone()), Cell::from(v.clone())])).collect();
-    let table = Table::new(rows, [Constraint::Percentage(30), Constraint::Percentage(70)]).block(Block::default().borders(Borders::ALL).title("Information")).header(Row::new(vec!["Metric", "Value"]).style(Style::default().fg(Color::Green)));
+    let table = Table::new(rows, [Constraint::Percentage(30), Constraint::Percentage(70)]).block(Block::default().borders(Borders::ALL).title("Live Metrics")).header(Row::new(vec!["Metric", "Value"]).style(Style::default().fg(Color::Green)));
     f.render_stateful_widget(table, area, &mut app.details_state);
 }
 
 fn render_uprober_view(f: &mut Frame, app: &App, area: Rect) {
-    let mut text = vec![Row::new(vec![Cell::from("UPS Intelligence Prober").style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))]), Row::new(vec![Cell::from("-------------------------")])];
-    if let Some(dev) = &app.identified_ups { text.push(Row::new(vec![Cell::from(format!("Vendor: {} | Model: {}", dev.vendor, dev.model))])); }
-    if app.is_walking { text.push(Row::new(vec![Cell::from("Walking MIB...")])); }
-    for res in &app.diff_results { text.push(Row::new(vec![Cell::from(format!("• {}: {} -> {}", res.change_type, res.old_value, res.new_value)).style(Style::default().fg(Color::Yellow))])); }
-    f.render_widget(Table::new(text, [Constraint::Percentage(100)]).block(Block::default().borders(Borders::ALL).title("Analysis Mode")), area);
+    let mut text = vec![Row::new(vec![Cell::from("UPS Intelligence Analysis").style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))])];
+    if let Some(dev) = &app.identified_ups { text.push(Row::new(vec![Cell::from(format!("HW: {} | FW: {}", dev.vendor, dev.model))])); }
+    if app.is_walking { text.push(Row::new(vec![Cell::from("Fetching real-time data...")])); }
+    for res in &app.diff_results { text.push(Row::new(vec![Cell::from(format!("• {}: -> {}", res.change_type, res.new_value)).style(Style::default().fg(Color::Yellow))])); }
+    f.render_widget(Table::new(text, [Constraint::Percentage(100)]).block(Block::default().borders(Borders::ALL).title("Uprober View")), area);
 }
