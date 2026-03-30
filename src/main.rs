@@ -151,7 +151,7 @@ impl App {
                     for (oid_str, label) in oids.iter() {
                         let parts: Vec<u64> = oid_str.split('.').filter(|s| !s.is_empty()).map(|s| s.parse::<u64>().unwrap_or(0)).collect();
                         if let Ok(oid) = Oid::from(&parts[..]) {
-                            if let Ok(resp) = session.get(&oid) { if let Some(vb) = resp.varbinds.into_iter().next() { results.push((label.to_string(), format!("{:?}", vb.1))); } }
+                            if let Ok(resp) = session.get(&oid) { if let Some(vb) = resp.varbinds.into_iter().next() { results.push((label.to_string(), clean_snmp_value(&vb.1))); } }
                         }
                     }
                 }
@@ -161,7 +161,7 @@ impl App {
                     for (oid_str, label) in oids.iter() {
                         let parts: Vec<u64> = oid_str.split('.').filter(|s| !s.is_empty()).map(|s| s.parse::<u64>().unwrap_or(0)).collect();
                         if let Ok(oid) = Oid::from(&parts[..]) {
-                            if let Ok(resp) = session.get(&oid) { if let Some(vb) = resp.varbinds.into_iter().next() { results.push((label.to_string(), format!("{:?}", vb.1))); } }
+                            if let Ok(resp) = session.get(&oid) { if let Some(vb) = resp.varbinds.into_iter().next() { results.push((label.to_string(), clean_snmp_value(&vb.1))); } }
                         }
                     }
                 }
@@ -419,4 +419,16 @@ fn render_uprober_view(f: &mut Frame, app: &App, area: Rect) {
     if app.is_walking { text.push(Row::new(vec![Cell::from("Fetching real-time data...")])); }
     for res in &app.diff_results { text.push(Row::new(vec![Cell::from(format!("• {}: -> {}", res.change_type, res.new_value)).style(Style::default().fg(Color::Yellow))])); }
     f.render_widget(Table::new(text, [Constraint::Percentage(100)]).block(Block::default().borders(Borders::ALL).title("Uprober View")), area);
+}
+
+fn clean_snmp_value(val: &snmp2::Value) -> String {
+    match val {
+        snmp2::Value::OctetString(b) => String::from_utf8_lossy(b).trim().to_string(),
+        snmp2::Value::Integer(i) => i.to_string(),
+        snmp2::Value::Counter32(c) => c.to_string(),
+        snmp2::Value::Unsigned32(u) => u.to_string(),
+        snmp2::Value::ObjectIdentifier(o) => o.to_string(),
+        snmp2::Value::Timeticks(t) => format!("{}s", t / 100),
+        _ => format!("{:?}", val),
+    }
 }

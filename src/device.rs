@@ -41,27 +41,29 @@ pub fn identify_category(descr: &str, oid: &str) -> DeviceCategory {
     let desc = descr.to_lowercase();
     let oid_str = oid.to_lowercase();
 
-    // 1. UPS / Power System Heuristics
-    if desc.contains("ups") || desc.contains("battery") || desc.contains("power") ||
-       desc.contains("backup") || desc.contains("volt") || desc.contains("current") ||
-       desc.contains("ammeter") || desc.contains("pdu") ||
+    // 1. Printer Heuristics (High Priority to avoid misidentification)
+    if desc.contains("printer") || desc.contains("pjl") || desc.contains("canon") || 
+       desc.contains("brother") || desc.contains("hp laserjet") || desc.contains("ricoh") ||
+       desc.contains("epson") || desc.contains("xerox") || desc.contains("lexmark") || 
+       desc.contains("kyocera") || desc.contains("konica") || desc.contains("oki") ||
+       desc.contains("inkjet") || desc.contains("imaging") {
+        return DeviceCategory::Printer;
+    }
+
+    // 2. UPS / Power System Heuristics
+    if desc.contains("ups") || desc.contains("battery") || desc.contains("pdu") ||
+       desc.contains("backup") || desc.contains("power management") ||
        oid_str.contains(".1.3.6.1.4.1.318") || // APC
        oid_str.contains(".1.3.6.1.4.1.3808") || // CyberPower
+       oid_str.contains(".1.3.6.1.4.1.534") || // Eaton
        oid_str.contains(".1.3.6.1.2.1.33") { // Standard UPS
         return DeviceCategory::UPS;
     }
 
-    // 2. Printer Heuristics
-    if desc.contains("printer") || desc.contains("pjl") || desc.contains("canon") || 
-       desc.contains("brother") || desc.contains("hp laserjet") || desc.contains("ricoh") ||
-       desc.contains("epson") || desc.contains("xerox") || desc.contains("lexmark") || 
-       desc.contains("kyocera") || desc.contains("konica") || desc.contains("oki") {
-        return DeviceCategory::Printer;
-    }
-
     // 3. Router/Switch Heuristics
     if desc.contains("switch") || desc.contains("router") || desc.contains("mikrotik") ||
-       desc.contains("cisco ios") || desc.contains("edgeos") || desc.contains("junos") {
+       desc.contains("cisco ios") || desc.contains("edgeos") || desc.contains("junos") ||
+       desc.contains("firewall") || desc.contains("ubiquiti") {
         return DeviceCategory::RouterSwitch;
     }
 
