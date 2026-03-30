@@ -8,7 +8,7 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, TableState, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame, Terminal,
 };
 use snmp2::{SyncSession, Oid};
@@ -39,6 +39,8 @@ pub struct App {
     pub discovered_devices: Vec<DeviceInfo>,
     pub discovered_ips: Vec<String>,
     pub selected_index: usize,
+    pub table_state: TableState,
+    pub details_state: TableState,
     pub is_scanning: bool,
     pub scan_progress: u32,
     pub scan_total: u32,
@@ -63,10 +65,14 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
+        let mut table_state = TableState::default();
+        table_state.select(Some(0));
         Self {
             discovered_devices: Vec::new(),
             discovered_ips: Vec::new(),
             selected_index: 0,
+            table_state,
+            details_state: TableState::default(),
             is_scanning: false,
             scan_progress: 0,
             scan_total: 0,
@@ -88,6 +94,30 @@ impl App {
         }
     }
 
+    fn select_next(&mut self, tx: Sender<ScanMessage>) {
+        if self.discovered_devices.is_empty() { return; }
+        let i = match self.table_state.selected() {
+            Some(i) => if i >= self.discovered_devices.len() - 1 { 0 } else { i + 1 },
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+        self.selected_index = i;
+        self.identified_ups = None;
+        self.start_snmp_update(tx);
+    }
+
+    fn select_previous(&mut self, tx: Sender<ScanMessage>) {
+        if self.discovered_devices.is_empty() { return; }
+        let i = match self.table_state.selected() {
+            Some(i) => if i == 0 { self.discovered_devices.len() - 1 } else { i - 1 },
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+        self.selected_index = i;
+        self.identified_ups = None;
+        self.start_snmp_update(tx);
+    }
+
     fn start_snmp_update(&mut self, tx: Sender<ScanMessage>) {
         if self.discovered_devices.is_empty() { return; }
         self.snmp_data.clear();
@@ -101,7 +131,7 @@ impl App {
 
         tokio::spawn(async move {
             let agent_addr = format!("{}:161", ip);
-            let timeout = Duration::from_secs(2);
+            let timeout = Duration::from_secs(1);
             let oids = [
                 (".1.3.6.1.2.1.1.1.0", "System Description"),
                 (".1.3.6.1.2.1.1.3.0", "System Uptime"),
@@ -186,9 +216,11 @@ impl App {
     }
 
     fn start_scan(&mut self, tx: Sender<ScanMessage>) {
+        if self.is_scanning { return; }
         self.is_scanning = true;
         self.discovered_devices.clear();
         self.discovered_ips.clear();
+        self.table_state.select(Some(0));
         self.selected_index = 0;
         self.scan_progress = 0;
         self.scan_total = 0;
@@ -198,7 +230,7 @@ impl App {
         let v3_auth = self.v3_auth_pass.clone();
         let v3_priv = self.v3_priv_pass.clone();
         
-        self.status = "Scanning...".to_string();
+        self.status = "Scanning (Boost Mode)...".to_string();
         
         tokio::spawn(async move {
             let interfaces = NetworkInterface::show().unwrap_or_default();
@@ -217,7 +249,7 @@ impl App {
             }
 
             let total_ips = (scan_targets.len() * 254) as u32;
-            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(30)); 
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(100));
             for subnet_prefix in scan_targets {
                 for i in 1..=254 {
                     let ip = format!("{}.{}", subnet_prefix, i);
@@ -230,10 +262,10 @@ impl App {
                     tokio::spawn(async move {
                         let _permit = sem_clone.acquire().await.unwrap();
                         let agent_addr = format!("{}:161", ip);
-                        let ip_for_blocking = ip.clone();
+                        let ip_clone = ip.clone();
                         let result = tokio::task::spawn_blocking(move || {
                             let sys_descr_oid = Oid::from(&[1, 3, 6, 1, 2, 1, 1, 1, 0]).unwrap();
-                            let timeout = Duration::from_secs(2);
+                            let timeout = Duration::from_millis(800);
                             let mut snmp_res = None;
                             
                             // 1. Try v3
@@ -278,14 +310,25 @@ impl App {
                             }
                             if let Some(res) = snmp_res { return Some(res); }
                             
-                            let addr = format!("{}:80", ip_for_blocking);
-                            if let Ok(_) = std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(1)) {
-                                return Some((DeviceCategory::WebDevice, "Port 80".to_string()));
+                            // 4. PORT SCAN FALLBACK
+                            let probe_ports = [80, 443, 445, 22];
+                            for port in probe_ports {
+                                let addr = format!("{}:{}", ip_clone, port);
+                                if let Ok(stream) = std::net::TcpStream::connect_timeout(&addr.parse().ok()?, Duration::from_millis(50)) {
+                                    drop(stream);
+                                    let cat = match port {
+                                        80 | 443 => DeviceCategory::WebDevice,
+                                        445 => DeviceCategory::Unknown,
+                                        22 => DeviceCategory::Unknown,
+                                        _ => DeviceCategory::Unknown,
+                                    };
+                                    return Some((cat, format!("Port {} Open", port)));
+                                }
                             }
                             None
                         }).await.unwrap_or(None);
                         if let Some((cat, desc)) = result {
-                            let info = DeviceInfo { ip: ip.clone(), category: cat, _description: desc, _sys_name: "".to_string() };
+                            let info = DeviceInfo { ip: ip.to_string(), category: cat, _description: desc, _sys_name: "".to_string() };
                             let _ = tx.send(ScanMessage::Discovered(info));
                         }
                         let _ = tx.send(ScanMessage::Progress(1, total_ips));
@@ -322,7 +365,7 @@ impl App {
         let ip = self.discovered_devices[self.selected_index].ip.clone();
         let community = self.community.clone();
         tokio::spawn(async move {
-            let root_oid = [1, 3, 6, 1, 2, 1]; // Use a broad walk for discovery
+            let root_oid = [1, 3, 6, 1, 2, 1];
             let addr = format!("{}:161", ip);
             if let Ok(data) = ups::snmp_walk(&addr, &community, &root_oid).await {
                 let snapshot = OidSnapshot { _timestamp: Instant::now(), data };
@@ -440,8 +483,8 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, tx: Send
                         KeyCode::Char('U') => { app.edit_mode = EditMode::V3User; app.temp_input = app.v3_user.clone(); }
                         KeyCode::Char('A') => { app.edit_mode = EditMode::V3Auth; app.temp_input = app.v3_auth_pass.clone(); }
                         KeyCode::Char('P') => { app.edit_mode = EditMode::V3Priv; app.temp_input = app.v3_priv_pass.clone(); }
-                        KeyCode::Down => if !app.discovered_devices.is_empty() { app.selected_index = (app.selected_index + 1) % app.discovered_devices.len(); app.start_snmp_update(tx.clone()); app.identified_ups = None; }
-                        KeyCode::Up => if !app.discovered_devices.is_empty() { app.selected_index = if app.selected_index > 0 { app.selected_index - 1 } else { app.discovered_devices.len() - 1 }; app.start_snmp_update(tx.clone()); app.identified_ups = None; }
+                        KeyCode::Down => app.select_next(tx.clone()),
+                        KeyCode::Up => app.select_previous(tx.clone()),
                         _ => {}
                     }
                 }
@@ -478,19 +521,44 @@ fn centered_rect(px: u16, py: u16, r: Rect) -> Rect {
     Layout::default().direction(Direction::Horizontal).constraints([Constraint::Percentage((100 - px) / 2), Constraint::Percentage(px), Constraint::Percentage((100 - px) / 2)]).split(popup[1])[1]
 }
 
-fn render_device_list(f: &mut Frame, app: &App, area: Rect) {
-    let rows: Vec<Row> = app.discovered_devices.iter().enumerate().map(|(i, d)| {
+fn render_device_list(f: &mut Frame, app: &mut App, area: Rect) {
+    let rows: Vec<Row> = app.discovered_devices.iter().enumerate().map(|(_, d)| {
         let color = match d.category { DeviceCategory::UPS => Color::LightRed, DeviceCategory::RouterSwitch => Color::Cyan, DeviceCategory::Printer => Color::Green, DeviceCategory::NAS => Color::Yellow, _ => Color::White };
-        let style = if i == app.selected_index { Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(color) };
-        Row::new(vec![Cell::from(format!("{} {}", d.category, d.ip))]).style(style)
+        Row::new(vec![Cell::from(format!("{} {}", d.category, d.ip))]).style(Style::default().fg(color))
     }).collect();
-    f.render_widget(Table::new(rows, [Constraint::Percentage(100)]).block(Block::default().borders(Borders::ALL).title("Network Map")), area);
+
+    let table = Table::new(rows, [Constraint::Percentage(100)])
+        .block(Block::default().borders(Borders::ALL).title("Network Map"))
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .highlight_symbol(">> ");
+
+    f.render_stateful_widget(table, area, &mut app.table_state);
+
+    // Scrollbar
+    let scrollbar = Scrollbar::default()
+        .orientation(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(Some("↑"))
+        .end_symbol(Some("↓"));
+    let mut scrollbar_state = ScrollbarState::new(app.discovered_devices.len()).position(app.table_state.selected().unwrap_or(0));
+    f.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
 }
 
-fn render_details(f: &mut Frame, app: &App, area: Rect) {
+fn render_details(f: &mut Frame, app: &mut App, area: Rect) {
     let rows: Vec<Row> = app.snmp_data.iter().map(|(l, v)| Row::new(vec![Cell::from(l.clone()).style(Style::default().add_modifier(Modifier::BOLD)), Cell::from(v.clone())])).collect();
     let title = if app.v3_enabled { format!("Details [V3: {}]", app.v3_user) } else { format!("Details [Comm: {}]", app.community) };
-    f.render_widget(Table::new(rows, [Constraint::Percentage(40), Constraint::Percentage(60)]).header(Row::new(vec!["Metric", "Value"]).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))).block(Block::default().borders(Borders::ALL).title(title)), area);
+    
+    let table = Table::new(rows, [Constraint::Percentage(40), Constraint::Percentage(60)])
+        .header(Row::new(vec!["Metric", "Value"]).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().bg(Color::DarkGray));
+
+    f.render_stateful_widget(table, area, &mut app.details_state);
+
+    // Scrollbar for details
+    let scrollbar = Scrollbar::default()
+        .orientation(ScrollbarOrientation::VerticalRight);
+    let mut scrollbar_state = ScrollbarState::new(app.snmp_data.len()).position(app.details_state.selected().unwrap_or(0));
+    f.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
 }
 
 fn render_uprober_view(f: &mut Frame, app: &App, area: Rect) {
