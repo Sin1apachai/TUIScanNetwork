@@ -22,7 +22,7 @@ use chrono::Local;
 
 mod ups;
 mod device;
-use ups::{OidSnapshot, DiffResult, UpsDevice, DefaultUprober, Uprober};
+use ups::{OidSnapshot, DiffResult, UpsDevice, DefaultUprober};
 use device::{DeviceCategory, DeviceInfo};
 use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 
@@ -322,7 +322,7 @@ impl App {
         let ip = self.discovered_devices[self.selected_index].ip.clone();
         let community = self.community.clone();
         tokio::spawn(async move {
-            let root_oid = [1, 3, 6, 1, 2, 1]; // System MIB and others
+            let root_oid = [1, 3, 6, 1, 2, 1]; // Use a broad walk for discovery
             let addr = format!("{}:161", ip);
             if let Ok(data) = ups::snmp_walk(&addr, &community, &root_oid).await {
                 let snapshot = OidSnapshot { _timestamp: Instant::now(), data };
@@ -431,6 +431,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, tx: Send
                                 app.snapshot_b = None;
                                 app.diff_results.clear();
                                 app.start_ups_walk(false, tx.clone());
+                                app.trigger_ups_identification(tx.clone());
                             }
                         }
                         KeyCode::Char('2') => { if app.show_uprober { app.start_ups_walk(true, tx.clone()); } }
@@ -439,8 +440,8 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, tx: Send
                         KeyCode::Char('U') => { app.edit_mode = EditMode::V3User; app.temp_input = app.v3_user.clone(); }
                         KeyCode::Char('A') => { app.edit_mode = EditMode::V3Auth; app.temp_input = app.v3_auth_pass.clone(); }
                         KeyCode::Char('P') => { app.edit_mode = EditMode::V3Priv; app.temp_input = app.v3_priv_pass.clone(); }
-                        KeyCode::Down => if !app.discovered_devices.is_empty() { app.selected_index = (app.selected_index + 1) % app.discovered_devices.len(); app.start_snmp_update(tx.clone()); }
-                        KeyCode::Up => if !app.discovered_devices.is_empty() { app.selected_index = if app.selected_index > 0 { app.selected_index - 1 } else { app.discovered_devices.len() - 1 }; app.start_snmp_update(tx.clone()); }
+                        KeyCode::Down => if !app.discovered_devices.is_empty() { app.selected_index = (app.selected_index + 1) % app.discovered_devices.len(); app.start_snmp_update(tx.clone()); app.identified_ups = None; }
+                        KeyCode::Up => if !app.discovered_devices.is_empty() { app.selected_index = if app.selected_index > 0 { app.selected_index - 1 } else { app.discovered_devices.len() - 1 }; app.start_snmp_update(tx.clone()); app.identified_ups = None; }
                         _ => {}
                     }
                 }
@@ -501,22 +502,20 @@ fn render_uprober_view(f: &mut Frame, app: &App, area: Rect) {
     if let Some(device) = &app.identified_ups {
         text.push(Row::new(vec![Cell::from(format!("Vendor: {}", device.vendor))]));
         text.push(Row::new(vec![Cell::from(format!("Model:  {}", device.model))]));
-    } else {
-        text.push(Row::new(vec![Cell::from("Identifying device...")]));
+    } else if app.is_walking {
+        text.push(Row::new(vec![Cell::from("Identifying / Walking...")]));
     }
 
     if app.snapshot_a.is_some() {
         text.push(Row::new(vec![Cell::from("[Step 1] Baseline Captured").style(Style::default().fg(Color::Green))]));
         if app.snapshot_b.is_none() {
-            text.push(Row::new(vec![Cell::from("Press '2' to capture second snapshot and analyze changes.")]));
+            text.push(Row::new(vec![Cell::from("Change something on UPS then press '2'").style(Style::default().fg(Color::Cyan))]));
         }
-    } else if app.is_walking {
-        text.push(Row::new(vec![Cell::from("Performing SNMP Walk... please wait...").style(Style::default().fg(Color::Yellow))]));
     }
 
     for res in &app.diff_results {
-        let style = if res.meaning.contains("Power") || res.meaning.contains("Load") { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
-        text.push(Row::new(vec![Cell::from(format!("• {}: {} -> {}", res.meaning, res.old_val, res.new_val)).style(style)]));
+        let style = if res.change_type.contains("Battery") || res.change_type.contains("Voltage") { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+        text.push(Row::new(vec![Cell::from(format!("• {}: {} -> {}", res.change_type, res.old_value, res.new_value)).style(style)]));
     }
 
     f.render_widget(Table::new(text, [Constraint::Percentage(100)]).block(Block::default().borders(Borders::ALL).title("UPS Analysis Mode")), area);
