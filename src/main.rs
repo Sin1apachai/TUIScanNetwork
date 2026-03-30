@@ -343,7 +343,7 @@ impl App {
         let ip = self.discovered_devices[self.selected_index].ip.clone();
         self.status = format!("Guessing for {}...", ip);
         tokio::spawn(async move {
-            let common = ["public", "private", "admin", "monitor", "internal", "snmp", "read", "manager", "1234"];
+            let common = ["public", "private", "ERXUPS", "admin", "monitor", "internal", "snmp", "read", "manager", "1234"];
             let addr = format!("{}:161", ip);
             let oid = Oid::from(&[1, 3, 6, 1, 2, 1, 1, 1, 0]).unwrap();
             for community in common {
