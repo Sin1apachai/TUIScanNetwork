@@ -125,7 +125,7 @@ impl App {
 
     fn select_next(&mut self, tx: Sender<ScanMessage>) {
         if self.show_config {
-            self.selected_config_idx = (self.selected_config_idx + 1) % 5;
+            self.selected_config_idx = (self.selected_config_idx + 1) % 8; // UPDATED MENU COUNT
             return;
         }
         if self.discovered_devices.is_empty() { return; }
@@ -141,7 +141,7 @@ impl App {
 
     fn select_previous(&mut self, tx: Sender<ScanMessage>) {
         if self.show_config {
-            self.selected_config_idx = if self.selected_config_idx == 0 { 4 } else { self.selected_config_idx - 1 };
+            self.selected_config_idx = if self.selected_config_idx == 0 { 7 } else { self.selected_config_idx - 1 };
             return;
         }
         if self.discovered_devices.is_empty() { return; }
@@ -479,6 +479,9 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App, tx: Send
                                 2 => if let Ok(v) = app.temp_input.parse() { app.config.timeout_ms = v; },
                                 3 => if let Ok(v) = app.temp_input.parse() { app.config.concurrency = v; },
                                 4 => app.community = app.temp_input.clone(),
+                                5 => app.v3_user = app.temp_input.clone(),
+                                6 => app.v3_auth_pass = app.temp_input.clone(),
+                                7 => app.v3_priv_pass = app.temp_input.clone(),
                                 _ => {}
                             }
                             app.edit_mode = EditMode::None;
@@ -573,7 +576,10 @@ fn render_config_page(f: &mut Frame, app: &App, area: Rect) {
         ("Trap Port", app.config.trap_port.to_string()),
         ("Timeout (ms)", app.config.timeout_ms.to_string()),
         ("Concurrency", app.config.concurrency.to_string()),
-        ("Current Community", app.community.clone()),
+        ("SNMP Community", app.community.clone()),
+        ("V3 Username", app.v3_user.clone()),
+        ("V3 Auth Pass", app.v3_auth_pass.clone()), // Added Auth Pass
+        ("V3 Priv Pass", app.v3_priv_pass.clone()), // Added Priv Pass
     ];
 
     let rows: Vec<Row> = items.iter().enumerate().map(|(i, (k, v))| {
