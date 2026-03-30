@@ -7,6 +7,9 @@ pub enum DeviceCategory {
     Printer,
     NAS,
     Server,
+    WebDevice,
+    SSH,
+    Alive,
     Unknown,
 }
 
@@ -18,6 +21,9 @@ impl fmt::Display for DeviceCategory {
             DeviceCategory::Printer => write!(f, "[PRT]"),
             DeviceCategory::NAS => write!(f, "[NAS]"),
             DeviceCategory::Server => write!(f, "[SVR]"),
+            DeviceCategory::WebDevice => write!(f, "[WEB]"),
+            DeviceCategory::SSH => write!(f, "[SSH]"),
+            DeviceCategory::Alive => write!(f, "[UP]"),
             DeviceCategory::Unknown => write!(f, "[???]"),
         }
     }
@@ -45,7 +51,9 @@ pub fn identify_category(descr: &str, oid: &str) -> DeviceCategory {
 
     // 2. Printer Heuristics
     if desc.contains("printer") || desc.contains("pjl") || desc.contains("canon") || 
-       desc.contains("brother") || desc.contains("hp laserjet") || desc.contains("ricoh") {
+       desc.contains("brother") || desc.contains("hp laserjet") || desc.contains("ricoh") ||
+       desc.contains("epson") || desc.contains("xerox") || desc.contains("lexmark") || 
+       desc.contains("kyocera") || desc.contains("konica") || desc.contains("oki") {
         return DeviceCategory::Printer;
     }
 
