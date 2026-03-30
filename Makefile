@@ -10,7 +10,13 @@ TARGET_WINDOWS=x86_64-pc-windows-gnu
 
 .PHONY: all clean build test package help
 
-all: clean build package
+all: clean test build-local
+
+build-local:
+	@echo "Building for local OS..."
+	cargo build --release
+	mkdir -p $(BUILD_DIR)
+	cp target/release/$(BINARY_NAME) $(BUILD_DIR)/
 
 help:
 	@echo "TUI Scan Network Build System"
@@ -25,10 +31,10 @@ build:
 	cargo build --release --target $(TARGET_MAC_ARM)
 	@echo "Building for macOS (Intel)..."
 	cargo build --release --target $(TARGET_MAC_INTEL)
-	@echo "Building for Linux (x64)..."
-	cargo build --release --target $(TARGET_LINUX)
-	@echo "Building for Windows (x64)..."
-	cargo build --release --target $(TARGET_WINDOWS)
+	@echo "Building for Linux (x64) via cross..."
+	cross build --release --target $(TARGET_LINUX)
+	@echo "Building for Windows (x64) via cross..."
+	cross build --release --target $(TARGET_WINDOWS)
 
 package:
 	@echo "Packaging releases..."
