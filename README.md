@@ -1,46 +1,46 @@
-# TUIScanNetwork - Rust SNMP TUI Scanner
+# 🚀 TUI Intelligent Network Scanner
 
-A Terminal User Interface (TUI) application built with Rust for monitoring and scanning SNMP-enabled devices on a local network.
+A high-performance TUI network scanner written in Rust using SNMP. This tool is designed to identify and monitor common network devices (UPS, Routers, Switches, Printers, NAS, and Servers) and perform deep analysis (Probing) for UPS health monitoring without requiring complex MIB files.
 
-![Screenshot](Screenshot.png)
+## ✨ Key Features
+- **Parallel Network Scanning**: Quickly scan subnets using SNMP v2c/v1.
+- **Intelligent Fingerprinting**: Automatically categorizes devices as `[UPS]`, `[NET]`, `[PRT]`, `[NAS]`, `[SVR]`, etc.
+- **UPS Probing & Diffing**: Heuristic OID discovery that identifies critical metrics (battery, voltage) by analyzing state changes.
+- **Cross-Platform**: Native builds for macOS (Universal), Linux, and Windows.
+- **Modern UI**: Full TUI experience using `ratatui`.
 
-## Features
-- **Network Discovery**: Instantly scan your local subnet (`/24`) for SNMP-responsive devices.
-- **Concurrent Probing**: Uses `Tokio` to parallelize probes (20 IPs at once) for high performance.
-- **Real-time Monitoring**: View standard system Metrics (`sysDesc`, `sysUptime`, `sysName`, etc.) directly from UI.
-- **Full Navigation**: Cycle through discovered devices using arrow keys to see their specific metrics.
-- **Manual Input**: Edit the target IP address and SNMP Community String on the fly.
+## 🛠️ Installation & Building
 
-## Requirements
-- Rust (Latest Stable)
-- An SNMP-enabled device in your network
+### Prerequisites
+- [Rust](https://rustup.rs/) (Stable)
+- `make` (Optional, for easy packaging)
 
-## Dependencies
-- `tokio`: Async runtime for parallel scanning
-- `ratatui`: The modern TUI framework
-- `crossterm`: Low-level terminal management
-- `snmp2`: SNMP protocol client
+### Build from source
+```bash
+cargo build --release
+```
 
-## Getting Started
+### Packaging for all platforms
+```bash
+# Add necessary targets
+rustup target add aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-gnu
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/Sin1apachai/TUIScanNetwork.git
-   cd TUIScanNetwork
-   ```
+# Build and package
+make all
+```
 
-2. Run the application:
-   ```bash
-   cargo run
-   ```
+## ⌨️ Controls
+- `s`: Start/Stop network scan.
+- `r`: Refresh current device SNMP data.
+- `u`: Enter/Exit UPS Prober mode.
+- `e`: Edit target IP address.
+- `Arrows`: Select discovered devices.
+- `q`: Quit application.
 
-## Controls
-- **`s`**: Initiate a parallel scan of the current subnet.
-- **`Up/Down Arrows`**: Switch between different discovered devices.
-- **`e`**: Edit the current Target IP or Community String.
-- **`r`**: Manually refresh the data for the selected IP.
-- **`q`**: Quit the application.
-- **`Esc`**: Cancel editing or scanning state.
+## 📦 Project Structure
+- `src/main.rs`: UI logic and async network scanning.
+- `src/device.rs`: Device fingerprinting and identification logic.
+- `src/ups.rs`: UPS-specific SNMP walk and delta analysis.
 
-## License
-MIT
+## 📝 License
+MIT License. Feel free to use and contribute!
