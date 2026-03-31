@@ -185,7 +185,7 @@ impl App {
                     Security::new(cfg.0.as_bytes(), cfg.1.as_bytes())
                         .with_auth_protocol(cfg.3)
                         .with_auth(match cfg.8 {
-                            SecurityLevel::NoAuth => Auth::None,
+                            SecurityLevel::NoAuth => Auth::NoAuthNoPriv,
                             SecurityLevel::AuthNoPriv => Auth::AuthNoPriv,
                             SecurityLevel::AuthPriv => Auth::AuthPriv { cipher: cfg.7, privacy_password: cfg.2.as_bytes().to_vec() },
                         })
