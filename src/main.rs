@@ -160,10 +160,16 @@ impl App {
                 (".1.3.6.1.4.1.935.10.1.1.3.4.0", "Battery Capacity (EPPC %)"),
                 (".1.3.6.1.2.1.33.1.2.5.0", "Battery Voltage (RFC V)"),
                 (".1.3.6.1.4.1.935.10.1.1.3.5.0", "Battery Voltage (EPPC V)"),
+                (".1.3.6.1.4.1.935.1.1.1.2.2.1.0", "Battery Capacity (Big %)"),
+                (".1.3.6.1.4.1.935.1.1.1.3.2.1.0", "Input Voltage (Big V)"),
+                (".1.3.6.1.4.1.935.1.1.1.4.2.1.0", "Output Voltage (Big V)"),
+                (".1.3.6.1.4.1.935.1.1.1.4.2.2.0", "Output Freq (Big Hz)"),
+                (".1.3.6.1.4.1.935.1.1.1.2.2.3.0", "Battery Temp (Big C)"),
                 (".1.3.6.1.2.1.33.1.2.2.0", "Time On Battery"),
                 (".1.3.6.1.2.1.33.1.2.3.0", "Backup Time (RFC Min)"),
                 (".1.3.6.1.4.1.935.10.1.1.2.8.0", "Backup Time (EPPC Min)"),
                 (".1.3.6.1.4.1.935.10.1.1.1.2.0", "Device Model"),
+                (".1.3.6.1.4.1.935.1.1.1.1.1.1.0", "Device Model (Big)"),
                 (".1.3.6.1.4.1.935.10.1.1.1.4.0", "Serial Number"),
                 (".1.3.6.1.4.1.935.10.1.1.1.6.0", "NMC Firmware"),
                 (".1.3.6.1.2.1.1.1.0", "System Desc"),
@@ -174,43 +180,40 @@ impl App {
 
             // Step 1: Try SNMP V3
             if !cfg.0.is_empty() {
-                let mut security = Security::new(cfg.0.as_bytes(), cfg.1.as_bytes()).with_auth_protocol(cfg.3);
-                security = match cfg.8 {
-                    SecurityLevel::NoAuth => security,
-                    SecurityLevel::AuthNoPriv => security.with_auth(Auth::AuthNoPriv),
-                    SecurityLevel::AuthPriv => security.with_auth(Auth::AuthPriv { cipher: cfg.7, privacy_password: cfg.2.as_bytes().to_vec() }),
+                let use_fallback;
+                let mut session_opt = match SyncSession::new_v3(&agent_addr, Some(timeout), 2, 
+                    Security::new(cfg.0.as_bytes(), cfg.1.as_bytes())
+                        .with_auth_protocol(cfg.3)
+                        .with_auth(match cfg.8 {
+                            SecurityLevel::NoAuth => Auth::None,
+                            SecurityLevel::AuthNoPriv => Auth::AuthNoPriv,
+                            SecurityLevel::AuthPriv => Auth::AuthPriv { cipher: cfg.7, privacy_password: cfg.2.as_bytes().to_vec() },
+                        })
+                ) {
+                    Ok(s) => Some(s),
+                    Err(_) => None,
                 };
 
-                let mut session_opt = None;
-                for _ in 0..3 {
-                    if let Ok(s) = SyncSession::new_v3(&agent_addr, Some(Duration::from_secs(3)), 1, security.clone()) {
-                        session_opt = Some(s);
-                        break;
-                    }
-                }
-
-                let mut use_fallback = true;
                 if let Some(ref mut session) = session_opt {
                     let mut lib_any_success = false;
                     for (oid_str, label) in oids.iter() {
                         let parts: Vec<u64> = oid_str.split('.').filter(|s| !s.is_empty()).map(|s| s.parse::<u64>().unwrap_or(0)).collect();
                         if let Ok(oid) = Oid::from(&parts[..]) {
-                            match session.get(&oid) {
-                                Ok(resp) => {
-                                    if let Some(vb) = resp.varbinds.into_iter().next() {
-                                        let val = clean_snmp_value(oid_str, &vb.1);
-                                        if !val.is_empty() && !val.contains("SUCH") && !val.contains("ERROR") {
-                                            results.push((label.to_string(), val));
-                                            snmp_success = true;
-                                            lib_any_success = true;
-                                        }
+                            if let Ok(resp) = session.get(&oid) {
+                                if let Some(vb) = resp.varbinds.into_iter().next() {
+                                    let val = clean_snmp_value(oid_str, &vb.1);
+                                    if !val.is_empty() && !val.contains("SUCH") {
+                                        results.push((label.to_string(), val));
+                                        lib_any_success = true;
+                                        snmp_success = true;
                                     }
                                 }
-                                Err(_) => {} // Individual OID failure, try fallback if nothing worked
                             }
                         }
                     }
                     use_fallback = !lib_any_success;
+                } else {
+                    use_fallback = true;
                 }
 
                 if use_fallback {
@@ -272,6 +275,10 @@ impl App {
                                             ".1.3.6.1.4.1.935.10.1.1.2.6.0",       // EPPC Output Freq
                                             ".1.3.6.1.4.1.935.10.1.1.3.5.0",       // EPPC Battery Volt
                                             ".1.3.6.1.4.1.935.10.1.1.2.12.0",      // EPPC Load %?
+                                            ".1.3.6.1.4.1.935.1.1.1.3.2.1.0",     // Big Input V
+                                            ".1.3.6.1.4.1.935.1.1.1.4.2.1.0",     // Big Output V
+                                            ".1.3.6.1.4.1.935.1.1.1.4.2.2.0",     // Big Freq
+                                            ".1.3.6.1.4.1.935.1.1.1.2.2.3.0",     // Big Temp
                                             ".1.3.6.1.4.1.318.1.1.1.2.2.2.0",      // APC Temp
                                             ".1.3.6.1.4.1.318.1.1.1.3.2.1.0",      // APC Input Volt
                                         ];
