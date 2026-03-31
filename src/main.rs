@@ -161,8 +161,21 @@ impl App {
                 (".1.3.6.1.2.1.33.1.2.5.0", "Battery Voltage (RFC V)"),
                 (".1.3.6.1.4.1.935.10.1.1.3.5.0", "Battery Voltage (EPPC V)"),
                 (".1.3.6.1.4.1.935.1.1.1.2.2.1.0", "Battery Capacity (Big %)"),
-                (".1.3.6.1.4.1.935.1.1.1.3.2.1.0", "Input Voltage (Big V)"),
-                (".1.3.6.1.4.1.935.1.1.1.4.2.1.0", "Output Voltage (Big V)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.2.2.0", "Input Voltage L1 (Big V)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.2.3.0", "Input Voltage L2 (Big V)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.2.4.0", "Input Voltage L3 (Big V)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.2.5.0", "Input Current L1 (Big A)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.2.6.0", "Input Current L2 (Big A)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.2.7.0", "Input Current L3 (Big A)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.3.2.0", "Output Voltage L1 (Big V)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.3.3.0", "Output Voltage L2 (Big V)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.3.4.0", "Output Voltage L3 (Big V)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.3.5.0", "Output Current L1 (Big A)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.3.6.0", "Output Current L2 (Big A)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.3.7.0", "Output Current L3 (Big A)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.5.1.0", "Output Load L1 (Big %)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.5.2.0", "Output Load L2 (Big %)"),
+                (".1.3.6.1.4.1.935.1.1.1.8.5.3.0", "Output Load L3 (Big %)"),
                 (".1.3.6.1.4.1.935.1.1.1.4.2.2.0", "Output Freq (Big Hz)"),
                 (".1.3.6.1.4.1.935.1.1.1.2.2.3.0", "Battery Temp (Big C)"),
                 (".1.3.6.1.2.1.33.1.2.2.0", "Time On Battery"),
@@ -279,6 +292,18 @@ impl App {
                                             ".1.3.6.1.4.1.935.1.1.1.4.2.1.0",     // Big Output V
                                             ".1.3.6.1.4.1.935.1.1.1.4.2.2.0",     // Big Freq
                                             ".1.3.6.1.4.1.935.1.1.1.2.2.3.0",     // Big Temp
+                                            ".1.3.6.1.4.1.935.1.1.1.8.2.2.0",     // Big In V L1
+                                            ".1.3.6.1.4.1.935.1.1.1.8.2.3.0",     // Big In V L2
+                                            ".1.3.6.1.4.1.935.1.1.1.8.2.4.0",     // Big In V L3
+                                            ".1.3.6.1.4.1.935.1.1.1.8.3.2.0",     // Big Out V L1
+                                            ".1.3.6.1.4.1.935.1.1.1.8.3.3.0",     // Big Out V L2
+                                            ".1.3.6.1.4.1.935.1.1.1.8.3.4.0",     // Big Out V L3
+                                            ".1.3.6.1.4.1.935.1.1.1.8.2.5.0",     // Big In A L1
+                                            ".1.3.6.1.4.1.935.1.1.1.8.2.6.0",     // Big In A L2
+                                            ".1.3.6.1.4.1.935.1.1.1.8.2.7.0",     // Big In A L3
+                                            ".1.3.6.1.4.1.935.1.1.1.8.3.5.0",     // Big Out A L1
+                                            ".1.3.6.1.4.1.935.1.1.1.8.3.6.0",     // Big Out A L2
+                                            ".1.3.6.1.4.1.935.1.1.1.8.3.7.0",     // Big Out A L3
                                             ".1.3.6.1.4.1.318.1.1.1.2.2.2.0",      // APC Temp
                                             ".1.3.6.1.4.1.318.1.1.1.3.2.1.0",      // APC Input Volt
                                         ];
@@ -325,10 +350,19 @@ impl App {
                 }
             }
 
-            // Final Send
+            // Final Send - ONLY send values that were successfully retrieved
             if snmp_success {
-                let _ = tx.send(ScanMessage::MetricUpdated(results));
-                let _ = tx.send(ScanMessage::Status("SNMP Update Success".to_string()));
+                // Filter out empty or "No Such" results to keep UI clean
+                let filtered_results: Vec<(String, String)> = results.into_iter()
+                    .filter(|(_, val)| !val.is_empty() && !val.to_uppercase().contains("NO SUCH"))
+                    .collect();
+
+                if !filtered_results.is_empty() {
+                    let _ = tx.send(ScanMessage::MetricUpdated(filtered_results));
+                    let _ = tx.send(ScanMessage::Status("SNMP Update Success".to_string()));
+                } else {
+                    let _ = tx.send(ScanMessage::Status("SNMP Success but no metrics found".to_string()));
+                }
             } else {
                 let _ = tx.send(ScanMessage::Status("SNMP Failed (No Data Found)".to_string()));
             }
