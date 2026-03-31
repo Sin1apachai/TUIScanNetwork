@@ -298,14 +298,7 @@ impl App {
                 }
             }
 
-            if snmp_success {
-                let _ = tx.send(ScanMessage::MetricUpdated(results));
-                let _ = tx.send(ScanMessage::Status("SNMP Update Success".to_string()));
-            } else {
-                let _ = tx.send(ScanMessage::Status("SNMP Failed (See Logs)".to_string()));
-            }
-
-            // Step 2: Try SNMP V2c
+            // Step 2: Try SNMP V2c fallback if V3 failed
             if !snmp_success {
                 if let Ok(mut session) = SyncSession::new_v2c(&agent_addr, cfg.4.as_bytes(), Some(timeout), 2) {
                     for (oid_str, label) in oids.iter() {
@@ -325,13 +318,13 @@ impl App {
                 }
             }
 
-            if !snmp_success {
-                let _ = tx.send(ScanMessage::Status("SNMP Failed (See Logs)".to_string()));
-            } else {
+            // Final Send
+            if snmp_success {
+                let _ = tx.send(ScanMessage::MetricUpdated(results));
                 let _ = tx.send(ScanMessage::Status("SNMP Update Success".to_string()));
+            } else {
+                let _ = tx.send(ScanMessage::Status("SNMP Failed (No Data Found)".to_string()));
             }
-
-            let _ = tx.send(ScanMessage::MetricUpdated(results));
 
             // Identification
             let dev_res = if !cfg.0.is_empty() { 
