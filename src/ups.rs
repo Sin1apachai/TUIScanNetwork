@@ -62,18 +62,67 @@ pub fn diff_snapshots(old: &OidSnapshot, new: &OidSnapshot, prober: &impl Uprobe
     results
 }
 
-pub async fn identify_ups_v3(addr: &str, user: &str, pass: &str, priv_pass: &str, proto: AuthProtocol) -> Result<Option<UpsDevice>> {
+pub async fn identify_ups_v3(addr: &str, user: &str, pass: &str, priv_pass: &str, proto: AuthProtocol, cipher: Cipher, level: crate::SecurityLevel) -> Result<Option<UpsDevice>> {
     let addr = addr.to_string();
     let user = user.to_string();
     let pass = pass.to_string();
     let priv_pass = priv_pass.to_string();
     
-    tokio::task::spawn_blocking(move || {
-        let timeout = Duration::from_secs(2);
-        let security = Security::new(user.as_bytes(), pass.as_bytes()).with_auth_protocol(proto).with_auth(Auth::AuthPriv { cipher: Cipher::Aes128, privacy_password: priv_pass.as_bytes().to_vec() });
-        let mut session = SyncSession::new_v3(&addr, Some(timeout), 1, security)?;
-        probe_vendor(&mut session)
-    }).await?
+    let library_res = tokio::task::spawn_blocking({
+        let addr = addr.clone();
+        let user = user.clone();
+        let pass = pass.clone();
+        let priv_pass = priv_pass.clone();
+        move || {
+            let mut security = Security::new(user.as_bytes(), pass.as_bytes()).with_auth_protocol(proto);
+            security = match level {
+                crate::SecurityLevel::NoAuth => security,
+                crate::SecurityLevel::AuthNoPriv => security.with_auth(Auth::AuthNoPriv),
+                crate::SecurityLevel::AuthPriv => security.with_auth(Auth::AuthPriv { cipher, privacy_password: priv_pass.as_bytes().to_vec() }),
+            };
+            if let Ok(mut session) = SyncSession::new_v3(&addr, Some(Duration::from_secs(5)), 5, security) {
+                return probe_vendor(&mut session);
+            }
+            Ok(None)
+        }
+    }).await?;
+
+    if let Ok(Some(dev)) = library_res { return Ok(Some(dev)); }
+
+    // FALLBACK: If library fails or returns nothing, try system snmpget for sysDescr and sysObjectID
+    let auth_level = match level {
+        crate::SecurityLevel::NoAuth => "noAuthNoPriv",
+        crate::SecurityLevel::AuthNoPriv => "authNoPriv",
+        crate::SecurityLevel::AuthPriv => "authPriv",
+    };
+    let cipher_str = match cipher {
+        Cipher::Aes128 => "AES",
+        Cipher::Des => "DES",
+        _ => "AES",
+    };
+
+    let output = std::process::Command::new("snmpget")
+        .args(&[
+            "-v", "3", "-u", &user, "-l", auth_level, "-a", "MD5", "-A", &pass, "-x", cipher_str, "-X", &priv_pass,
+            "-On", "-t", "5", "-r", "1",
+            &addr, ".1.3.6.1.2.1.1.1.0"
+        ])
+        .output();
+
+    if let Ok(out) = output {
+        let desc = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        if desc.contains(" = ") {
+            let actual_desc = desc.split(" = ").last().unwrap_or("").trim();
+            let vendor = UpsVendor::RFC1628Standard;
+            if actual_desc.contains("network management card") || actual_desc.contains("ups") || actual_desc.contains("battery") {
+                // Heuristic identification via sysDescr if it's all we have
+                let model = if actual_desc.len() > 30 { actual_desc[..30].to_string() } else { actual_desc.to_string() };
+                return Ok(Some(UpsDevice { vendor, model, _firmware: "N/A".to_string() }));
+            }
+        }
+    }
+    
+    Ok(None)
 }
 
 pub async fn identify_ups_v2(addr: &str, community: &str) -> Result<Option<UpsDevice>> {
@@ -89,6 +138,7 @@ fn probe_vendor(session: &mut SyncSession) -> Result<Option<UpsDevice>> {
     let sys_object_id = Oid::from(&[1, 3, 6, 1, 2, 1, 1, 2, 0]).unwrap();
     let mut vendor = UpsVendor::Unknown;
     let mut model = "Unknown".to_string();
+
     
     if let Ok(resp) = session.get(&sys_object_id) {
         if let Some(vb) = resp.varbinds.into_iter().next() {
@@ -104,18 +154,20 @@ fn probe_vendor(session: &mut SyncSession) -> Result<Option<UpsDevice>> {
     }
     
     let sys_descr = Oid::from(&[1, 3, 6, 1, 2, 1, 1, 1, 0]).unwrap();
+
     if let Ok(resp) = session.get(&sys_descr) {
         if let Some(vb) = resp.varbinds.into_iter().next() {
             let desc = format!("{:?}", vb.1).to_lowercase();
             if vendor == UpsVendor::Unknown && (desc.contains("ups") || desc.contains("battery")) { vendor = UpsVendor::RFC1628Standard; }
+            if desc.contains("network management card") { vendor = UpsVendor::RFC1628Standard; }
             model = if desc.len() > 30 { desc[..30].to_string() } else { desc };
         }
     }
-
+    
     if vendor != UpsVendor::Unknown { Ok(Some(UpsDevice { vendor, model, _firmware: "N/A".to_string() })) } else { Ok(None) }
 }
 
-pub async fn snmp_walk_v3(addr: &str, user: &str, pass: &str, priv_pass: &str, proto: AuthProtocol, root: &[u64]) -> Result<HashMap<String, String>> {
+pub async fn snmp_walk_v3(addr: &str, user: &str, pass: &str, priv_pass: &str, proto: AuthProtocol, root: &[u64], cipher: Cipher, level: crate::SecurityLevel) -> Result<HashMap<String, String>> {
     let addr = addr.to_string();
     let user = user.to_string();
     let p1 = pass.to_string();
@@ -123,8 +175,13 @@ pub async fn snmp_walk_v3(addr: &str, user: &str, pass: &str, priv_pass: &str, p
     let root = root.to_vec();
     
     tokio::task::spawn_blocking(move || {
-        let security = Security::new(user.as_bytes(), p1.as_bytes()).with_auth_protocol(proto).with_auth(Auth::AuthPriv { cipher: Cipher::Aes128, privacy_password: p2.as_bytes().to_vec() });
-        let mut session = SyncSession::new_v3(&addr, Some(Duration::from_millis(1500)), 1, security)?;
+        let mut security = Security::new(user.as_bytes(), p1.as_bytes()).with_auth_protocol(proto);
+        security = match level {
+            crate::SecurityLevel::NoAuth => security,
+            crate::SecurityLevel::AuthNoPriv => security.with_auth(Auth::AuthNoPriv),
+            crate::SecurityLevel::AuthPriv => security.with_auth(Auth::AuthPriv { cipher, privacy_password: p2.as_bytes().to_vec() }),
+        };
+        let mut session = SyncSession::new_v3(&addr, Some(Duration::from_secs(5)), 5, security)?;
         perform_walk(&mut session, &root)
     }).await?
 }

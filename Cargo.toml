@@ -2,6 +2,7 @@
 name = "tui_scan_network"
 version = "0.1.0"
 edition = "2024"
+default-run = "tui_scan_network"
 
 [dependencies]
 anyhow = "1.0.102"
